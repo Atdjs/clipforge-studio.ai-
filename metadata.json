@@ -1,0 +1,6 @@
+{
+  "name": "Clip Cutter",
+  "description": "AI-powered short-form video clip finder and browser-based video cutter with SRT caption export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

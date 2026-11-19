@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>Clip Cutter — Quietly Precise Video Clipping</title>
+    <meta
+      name="description"
+      content="Cut long videos into vertical shorts on your device. Virality scores, hook detection, silence trimming, and burned-in captions."
+    />
+    <meta property="og:title" content="Clip Cutter — Quietly Precise Video Clipping" />
+    <meta
+      property="og:description"
+      content="Cut long videos into vertical shorts on your device. Virality scores, hook detection, silence trimming, and burned-in captions."
+    />
+    <meta property="og:type" content="website" />
+    <meta property="og:image" content="/og-share.jpg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Clip Cutter — Quietly Precise Video Clipping" />
+    <meta
+      name="twitter:description"
+      content="Cut long videos into vertical shorts on your device. Virality scores, hook detection, silence trimming, and burned-in captions."
+    />
+    <meta name="twitter:image" content="/og-share.jpg" />
+    <meta name="theme-color" content="#0E0E0F" />
+    <script>
+      (function () {
+        try {
+          var saved = localStorage.getItem('clip-cutter-theme');
+          if (saved === 'light') {
+            document.documentElement.classList.remove('dark');
+          } else {
+            document.documentElement.classList.add('dark');
+          }
+        } catch (e) {}
+      })();
+    </script>
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@graph": [
+          {
+            "@type": "WebApplication",
+            "name": "Clip Cutter",
+            "applicationCategory": "MultimediaApplication",
+            "operatingSystem": "Web Browser",
+            "description": "Cut long videos into vertical shorts on your device with virality scores, hook detection, silence trimming, and burned-in captions.",
+            "offers": {
+              "@type": "Offer",
+              "price": "0",
+              "priceCurrency": "USD"
+            }
+          },
+          {
+            "@type": "FAQPage",
+            "mainEntity": [
+              {
+                "@type": "Question",
+                "name": "What file sizes and video formats are supported?",
+                "acceptedAnswer": {
+                  "@type": "Answer",
+                  "text": "You can upload MP4 or MOV files up to 1 GB (1024 MB). Large files stream to our proxy in 8 MB slices and mount locally via WORKERFS. Best performance is on source videos up to 30 minutes."
+                }
+              },
+              {
+                "@type": "Question",
+                "name": "Where are my videos processed and stored?",
+                "acceptedAnswer": {
+                  "@type": "Answer",
+                  "text": "Videos are cut, reframed, silence-trimmed, and captioned directly on your device using WebAssembly FFmpeg. Audio is sent securely through our server proxy for transcription and highlight analysis only when you start AI analysis."
+                }
+              },
+              {
+                "@type": "Question",
+                "name": "How do YouTube links and copyright work?",
+                "acceptedAnswer": {
+                  "@type": "Answer",
+                  "text": "Public YouTube links are analyzed for timestamps and transcripts without ripping streams in your browser. Upload your own authorized source file to cut downloadable MP4 clips."
+                }
+              },
+              {
+                "@type": "Question",
+                "name": "How do daily AI credits work?",
+                "acceptedAnswer": {
+                  "@type": "Answer",
+                  "text": "Each visitor receives 40 daily AI credits on our server. Manual cutting, waveform trimming, and local FFmpeg exports never consume AI credits."
+                }
+              }
+            ]
+          }
+        ]
+      }
+    </script>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400..600;1,9..40,400..600&family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=JetBrains+Mono:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+  </head>
+  <body class="bg-[#F7F5F0] text-[#151517] dark:bg-[#0E0E0F] dark:text-[#F2F0EA] antialiased selection:bg-[#E8A33D]/25 selection:text-[#151517] dark:selection:text-[#F2F0EA] transition-colors duration-200">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
