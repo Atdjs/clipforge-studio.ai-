@@ -2,20 +2,22 @@ import type { ActiveLinkTarget } from '../components/UploadZone';
 import type {
   AutoEditSettings,
   BrandSettings,
+  CachedTranscriptRecord,
   CaptionLanguage,
   ClipItem,
   ClipSettings,
   ClipSourceMode,
-  GeminiFileSession,
   InputMode,
+  LinkedDriveFile,
   RecentProjectSummary,
   TranscriptSegment,
   ViralitySubScores,
 } from '../types/clip';
 
 const DB_NAME = 'clip-cutter-session-db';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const STORE_NAME = 'sessions';
+const TRANSCRIPT_STORE = 'transcripts';
 const SESSION_KEY = 'active-session';
 const BRAND_KEY = 'brand-template';
 const RECENT_PROJECTS_KEY = 'clip-cutter-recent-projects';
@@ -57,9 +59,10 @@ export interface PersistedSession {
   settings: ClipSettings;
   autoSaveWhenReady: boolean;
   sourceFile?: File | null;
+  fileHash?: string;
+  cachedTranscript?: TranscriptSegment[];
   activeLink?: ActiveLinkTarget | null;
-  youtubeVideoId?: string;
-  geminiSession?: GeminiFileSession | null;
+  linkedDriveFile?: LinkedDriveFile | null;
   clips: StoredClipRecord[];
 }
 
@@ -77,6 +80,9 @@ function openSessionDb(): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains(STORE_NAME)) {
         db.createObjectStore(STORE_NAME);
       }
+      if (!db.objectStoreNames.contains(TRANSCRIPT_STORE)) {
+        db.createObjectStore(TRANSCRIPT_STORE, { keyPath: 'fileHash' });
+      }
     };
 
     request.onsuccess = () => resolve(request.result);
@@ -84,9 +90,52 @@ function openSessionDb(): Promise<IDBDatabase> {
   });
 }
 
+export async function saveTranscriptToIndexedDb(record: CachedTranscriptRecord): Promise<void> {
+  if (!record.fileHash || record.segments.length === 0) return;
+  try {
+    const db = await openSessionDb();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(TRANSCRIPT_STORE, 'readwrite');
+      tx.objectStore(TRANSCRIPT_STORE).put(record);
+      tx.oncomplete = () => {
+        db.close();
+        resolve();
+      };
+      tx.onerror = () => {
+        db.close();
+        reject(tx.error);
+      };
+    });
+  } catch {
+    // Ignore IndexedDB quota issues
+  }
+}
+
+export async function loadTranscriptFromIndexedDb(
+  fileHash: string,
+): Promise<CachedTranscriptRecord | null> {
+  if (!fileHash) return null;
+  try {
+    const db = await openSessionDb();
+    return await new Promise<CachedTranscriptRecord | null>((resolve, reject) => {
+      const tx = db.transaction(TRANSCRIPT_STORE, 'readonly');
+      const req = tx.objectStore(TRANSCRIPT_STORE).get(fileHash);
+      req.onsuccess = () => {
+        db.close();
+        resolve((req.result as CachedTranscriptRecord | undefined) ?? null);
+      };
+      req.onerror = () => {
+        db.close();
+        reject(req.error);
+      };
+    });
+  } catch {
+    return null;
+  }
+}
+
 /**
- * Persist the active clip list, settings, source File, and finished MP4 Blobs to IndexedDB
- * so reloading the tab lets the user restore and resume seamlessly.
+ * Persist active clip list, settings, cached transcript, Drive link, source File, and cut MP4 Blobs.
  */
 export async function saveSessionToIndexedDb(session: PersistedSession): Promise<void> {
   try {
@@ -134,7 +183,7 @@ export async function loadSessionFromIndexedDb(): Promise<PersistedSession | nul
 }
 
 /**
- * Clear saved session data from IndexedDB when user starts fresh.
+ * Clear saved active session data from IndexedDB when user starts fresh.
  */
 export async function clearSessionFromIndexedDb(): Promise<void> {
   try {
@@ -157,14 +206,15 @@ export async function clearSessionFromIndexedDb(): Promise<void> {
 }
 
 /**
- * Erase all locally stored Clip Cutter data (session, MP4 blobs, and brand template) from IndexedDB.
+ * Erase all locally stored Clip Cutter data (sessions, cached transcripts, MP4 blobs, and brand template).
  */
 export async function clearAllFromIndexedDb(): Promise<void> {
   try {
     const db = await openSessionDb();
     await new Promise<void>((resolve) => {
-      const tx = db.transaction(STORE_NAME, 'readwrite');
+      const tx = db.transaction([STORE_NAME, TRANSCRIPT_STORE], 'readwrite');
       tx.objectStore(STORE_NAME).clear();
+      tx.objectStore(TRANSCRIPT_STORE).clear();
       tx.oncomplete = () => {
         db.close();
         resolve();

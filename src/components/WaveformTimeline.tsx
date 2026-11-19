@@ -5,6 +5,7 @@ import { formatTimecode } from '../utils/format';
 
 interface WaveformTimelineProps {
   video: VideoAsset;
+  extractedAudioBlob?: Blob | null;
   clip: ClipItem;
   clipIndex: number;
   disabled: boolean;
@@ -32,10 +33,12 @@ function buildFallbackEnvelope(seedStr: string, count: number): number[] {
 
 /**
  * Interactive waveform timeline for the currently focused clip.
- * Features draggable start/end trim handles and 0.1s precision nudge buttons.
+ * Reuses the extracted compact 16 kHz mono audio track when available so even 1 GB videos
+ * display a real PCM waveform without loading full video bytes into RAM.
  */
 export function WaveformTimeline({
   video,
+  extractedAudioBlob,
   clip,
   clipIndex,
   disabled,
@@ -53,17 +56,22 @@ export function WaveformTimeline({
     setPeaks(buildFallbackEnvelope(video.name, BAR_COUNT));
     setIsRealAudioWaveform(false);
 
-    if (video.sizeBytes > MAX_PCM_DECODE_BYTES) {
+    const decodeSource: Blob | null =
+      extractedAudioBlob || (video.sizeBytes <= MAX_PCM_DECODE_BYTES ? video.file : null);
+
+    if (!decodeSource) {
       return;
     }
 
-    const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    const AudioCtx =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
     if (!AudioCtx) return;
 
     const ctx = new AudioCtx();
     void (async () => {
       try {
-        const buffer = await video.file.arrayBuffer();
+        const buffer = await decodeSource.arrayBuffer();
         if (cancelled) return;
         const decoded = await ctx.decodeAudioData(buffer.slice(0));
         if (cancelled) return;
@@ -91,7 +99,7 @@ export function WaveformTimeline({
           setIsRealAudioWaveform(true);
         }
       } catch {
-        // Silent fallback when container codec isn't natively decodable by Web Audio
+        // Silent fallback if browser cannot decode container audio
       } finally {
         void ctx.close().catch(() => {});
       }
@@ -101,7 +109,7 @@ export function WaveformTimeline({
       cancelled = true;
       void ctx.close().catch(() => {});
     };
-  }, [video.file, video.name, video.sizeBytes]);
+  }, [extractedAudioBlob, video.file, video.name, video.sizeBytes]);
 
   const startPct = Math.max(0, Math.min(99, (clip.start_seconds / totalDuration) * 100));
   const endPct = Math.max(startPct + 1, Math.min(100, (clip.end_seconds / totalDuration) * 100));
@@ -177,7 +185,11 @@ export function WaveformTimeline({
             <p className="font-mono text-[11px] tabular-nums text-[#64625D] dark:text-[#8C8C93]">
               {formatTimecode(clip.start_seconds)} – {formatTimecode(clip.end_seconds)} ({clipDuration.toFixed(1)}s)
               {' · '}
-              {isRealAudioWaveform ? 'Audio PCM waveform' : 'Cadence preview (1 GB memory-safe)'}
+              {isRealAudioWaveform
+                ? extractedAudioBlob
+                  ? 'Extracted audio waveform'
+                  : 'Audio PCM waveform'
+                : 'Cadence preview (1 GB memory-safe)'}
             </p>
           </div>
         </div>
@@ -234,14 +246,12 @@ export function WaveformTimeline({
         onPointerCancel={() => setDragHandle(null)}
         className="relative flex h-16 touch-none select-none items-center gap-[2px] overflow-hidden rounded-lg border border-[#DFDCD2] bg-[#F7F5F0] px-2 dark:border-[#2A2A2E] dark:bg-[#0E0E0F]"
       >
-        {/* Active selection highlight */}
         <div
           aria-hidden="true"
           className="pointer-events-none absolute inset-y-0 bg-[#E8A33D]/12"
           style={{ left: `${startPct}%`, width: `${widthPct}%` }}
         />
 
-        {/* Waveform bars */}
         {activeBars.map((height, idx) => {
           const barPct = ((idx + 0.5) / activeBars.length) * 100;
           const inside = barPct >= startPct && barPct <= endPct;
@@ -250,16 +260,13 @@ export function WaveformTimeline({
               key={idx}
               aria-hidden="true"
               className={`relative z-0 flex-1 rounded-full transition-colors duration-100 motion-reduce:transition-none ${
-                inside
-                  ? 'bg-[#E8A33D]'
-                  : 'bg-[#DFDCD2] dark:bg-[#2A2A2E]'
+                inside ? 'bg-[#E8A33D]' : 'bg-[#DFDCD2] dark:bg-[#2A2A2E]'
               }`}
               style={{ height: `${Math.round(height * 78)}%` }}
             />
           );
         })}
 
-        {/* Start Trim Handle */}
         <button
           type="button"
           disabled={disabled}
@@ -275,7 +282,6 @@ export function WaveformTimeline({
           <span className="h-5 w-0.5 rounded-full bg-[#0E0E0F]" />
         </button>
 
-        {/* End Trim Handle */}
         <button
           type="button"
           disabled={disabled}

@@ -1,4 +1,10 @@
-import { MAX_UPLOAD_BYTES, MAX_UPLOAD_MB, type VideoAsset } from '../types/clip';
+import {
+  MAX_CLOUD_TRANSCRIBE_SECONDS,
+  MAX_UPLOAD_BYTES,
+  MAX_UPLOAD_MB,
+  type VideoAsset,
+} from '../types/clip';
+import { computeVideoFileHash } from '../utils/fileHash';
 
 // Soft notice threshold for chunked streaming hint (files between 500 MB and 1024 MB)
 const LARGE_STREAM_NOTICE_BYTES = 500 * 1024 * 1024;
@@ -31,8 +37,8 @@ export async function inspectLocalVideo(file: File): Promise<VideoAsset> {
   const objectUrl = URL.createObjectURL(file);
 
   try {
-    const metadata = await new Promise<{ duration: number; width: number; height: number }>(
-      (resolve, reject) => {
+    const [metadata, fileHash] = await Promise.all([
+      new Promise<{ duration: number; width: number; height: number }>((resolve, reject) => {
         const video = document.createElement('video');
         video.preload = 'metadata';
         video.muted = true;
@@ -63,8 +69,9 @@ export async function inspectLocalVideo(file: File): Promise<VideoAsset> {
         };
 
         video.src = objectUrl;
-      },
-    );
+      }),
+      computeVideoFileHash(file).catch(() => undefined),
+    ]);
 
     if (metadata.duration <= 0) {
       URL.revokeObjectURL(objectUrl);
@@ -79,8 +86,10 @@ export async function inspectLocalVideo(file: File): Promise<VideoAsset> {
       durationSeconds: metadata.duration,
       width: metadata.width,
       height: metadata.height,
+      fileHash,
       isLargeFile: file.size > LARGE_STREAM_NOTICE_BYTES,
       isOverDurationLimit: metadata.duration > MAX_RECOMMENDED_SECONDS,
+      isOverCloudTranscribeLimit: metadata.duration > MAX_CLOUD_TRANSCRIBE_SECONDS,
     };
   } catch (err) {
     URL.revokeObjectURL(objectUrl);

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AlertCircle, Play, RefreshCw, Scissors, Upload, X } from 'lucide-react';
+import { AlertCircle, Cloud, FolderOpen, Play, RefreshCw, X } from 'lucide-react';
 import { AllTimelinesStrip } from './components/AllTimelinesStrip';
 import { AnalysisProgress } from './components/AnalysisProgress';
 import { AnalysisSettings } from './components/AnalysisSettings';
@@ -11,6 +11,7 @@ import { ClipInsightsPanel } from './components/ClipInsightsPanel';
 import { type CustomClipInput, CustomClipCreator } from './components/CustomClipCreator';
 import { DeleteConfirmModal } from './components/DeleteConfirmModal';
 import { FeedbackModal } from './components/FeedbackModal';
+import { GoogleDriveSyncModal } from './components/GoogleDriveSyncModal';
 import { Header } from './components/Header';
 import { LandingSections } from './components/LandingSections';
 import { LegalPage, type LegalSectionId } from './components/LegalPage';
@@ -21,20 +22,16 @@ import { StudioActionBar } from './components/StudioActionBar';
 import { ToastHost, type ToastMessage } from './components/ToastHost';
 import { type ActiveLinkTarget, UploadZone } from './components/UploadZone';
 import { WaveformTimeline } from './components/WaveformTimeline';
-import { SAMPLE_VIDEO_CONFIG } from './config/siteContent';
 import { useStudioKeyboardShortcuts } from './hooks/useStudioKeyboardShortcuts';
 import {
-  analyzeVideoForClips,
-  analyzeYouTubeForClips,
-  deleteRemoteVideoFile,
   fetchDirectVideoUrlInBrowser,
   fetchServerUsage,
   findMomentsViaProxy,
   generateClipMetadataViaProxy,
+  scoreClipsBatchViaProxy,
   scoreClipViaProxy,
+  transcribeAudioBlobViaProxy,
   translateClipsCaptions,
-  uploadVideoToGemini,
-  waitForFileActive,
 } from './services/apiClient';
 import {
   downloadAllClipsAsZip,
@@ -43,7 +40,16 @@ import {
   downloadSceneBreakdownJson,
   shareOrDownloadClip,
 } from './services/exportService';
-import { clearFFmpegCache, cutClipInBrowser } from './services/ffmpegService';
+import {
+  clearFFmpegCache,
+  cutClipInBrowser,
+  extractCompactAudioInBrowser,
+} from './services/ffmpegService';
+import { subscribeDriveAuthState, type DriveAuthUser } from './services/googleAuthService';
+import {
+  buildDriveProjectSnapshot,
+  type DriveProjectSnapshot,
+} from './services/googleDriveSyncService';
 import {
   clearAllFromIndexedDb,
   clearRecentProjects,
@@ -51,11 +57,14 @@ import {
   loadBrandSettingsFromIndexedDb,
   loadRecentProjects,
   loadSessionFromIndexedDb,
+  loadTranscriptFromIndexedDb,
   saveBrandSettingsToIndexedDb,
   saveRecentProjectSummary,
   saveSessionToIndexedDb,
+  saveTranscriptToIndexedDb,
 } from './services/persistenceService';
 import { inspectLocalVideo } from './services/videoMetadata';
+import { transcribeWithWhisperInBrowser } from './services/whisperService';
 import type {
   AnalysisPhase,
   AppError,
@@ -66,15 +75,15 @@ import type {
   ClipItem,
   ClipSettings,
   ClipSourceMode,
-  GeminiFileSession,
   InputMode,
+  LinkedDriveFile,
   RecentProjectSummary,
   ServerUsageStatus,
   ThemeMode,
   TranscriptSegment,
   VideoAsset,
 } from './types/clip';
-import { findOverlappingClipIds } from './utils/format';
+import { findOverlappingClipIds, formatTimecode } from './utils/format';
 
 const DEFAULT_PAGE_TITLE = 'Clip Cutter — Quietly Precise Video Clipping';
 const THEME_STORAGE_KEY = 'clip-cutter-theme';
@@ -94,6 +103,7 @@ const DEFAULT_SETTINGS: ClipSettings = {
   aspectFormat: 'vertical',
   customPrompt: '',
   captionLanguage: 'English',
+  transcriptionEngine: 'cloud',
   autoEdit: DEFAULT_AUTO_EDIT,
 };
 
@@ -167,12 +177,27 @@ export default function App() {
     [pushToast],
   );
 
-  // Step 1: Input mode ("Upload file" | "Paste link") & local/link sources
+  // Google Drive Auth & Sync State (OAuth access token stays strictly in memory)
+  const [driveAuthUser, setDriveAuthUser] = useState<DriveAuthUser | null>(null);
+  const [linkedDriveFile, setLinkedDriveFile] = useState<LinkedDriveFile | null>(null);
+  const [isDriveModalOpen, setIsDriveModalOpen] = useState(false);
+  const [driveRestoreMeta, setDriveRestoreMeta] = useState<
+    DriveProjectSnapshot['videoMeta'] | null
+  >(null);
+
+  useEffect(() => {
+    return subscribeDriveAuthState(setDriveAuthUser);
+  }, []);
+
+  // Step 1: Input mode ("Upload file" | "Paste direct URL") & local/link sources
   const [inputMode, setInputMode] = useState<InputMode>('file');
   const [video, setVideo] = useState<VideoAsset | null>(null);
   const [activeLink, setActiveLink] = useState<ActiveLinkTarget | null>(null);
   const [selectionError, setSelectionError] = useState<string | null>(null);
-  const [pendingReuseClips, setPendingReuseClips] = useState<ClipItem[]>([]);
+
+  // Extracted compact 16 kHz mono audio & cached transcript (reused by waveform & text-only AI)
+  const [extractedAudioBlob, setExtractedAudioBlob] = useState<Blob | null>(null);
+  const [cachedTranscript, setCachedTranscript] = useState<TranscriptSegment[]>([]);
 
   // Step 2: Settings & Brand template
   const [settings, setSettings] = useState<ClipSettings>(DEFAULT_SETTINGS);
@@ -209,24 +234,23 @@ export default function App() {
   const [translationError, setTranslationError] = useState<string | null>(null);
   const translateAbortRef = useRef<AbortController | null>(null);
 
-  // Step 3: Gemini Files API / Link analysis session state
+  // Step 3: Audio extraction, transcription & text-only analysis state
   const [phase, setPhase] = useState<AnalysisPhase>('idle');
-  const [analysisMode, setAnalysisMode] = useState<'file' | 'youtube' | 'direct-url'>('file');
+  const [analysisMode, setAnalysisMode] = useState<'file' | 'direct-url'>('file');
   const [fetchProgress, setFetchProgress] = useState<number | null>(null);
-  const [uploadProgress, setUploadProgress] = useState(0);
-  const [remoteFileState, setRemoteFileState] = useState('');
-  const [geminiSession, setGeminiSession] = useState<GeminiFileSession | null>(null);
+  const [audioExtractProgress, setAudioExtractProgress] = useState(0);
+  const [transcribeStatusLabel, setTranscribeStatusLabel] = useState('');
   const [analysisError, setAnalysisError] = useState<AppError | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
 
-  // Stage 1: Prompt-based moments finder & per-clip metadata generator states
+  // Prompt-based moments finder, batch scoring & per-clip metadata states
   const [isSearchingMoments, setIsSearchingMoments] = useState(false);
   const [momentSearchError, setMomentSearchError] = useState<string | null>(null);
   const [momentCandidates, setMomentCandidates] = useState<ClipItem[]>([]);
   const [addedCandidateIds, setAddedCandidateIds] = useState<Set<string>>(new Set());
   const [generatingMetaClipIds, setGeneratingMetaClipIds] = useState<Set<string>>(new Set());
   const [scoringClipIds, setScoringClipIds] = useState<Set<string>>(new Set());
-  const [isLoadingSample, setIsLoadingSample] = useState(false);
+  const [isBatchScoring, setIsBatchScoring] = useState(false);
 
   // Modals & bottom sheet state
   const [isShortcutsOpen, setIsShortcutsOpen] = useState(false);
@@ -242,7 +266,6 @@ export default function App() {
   }, [clips]);
 
   const [clipSourceMode, setClipSourceMode] = useState<ClipSourceMode>('file');
-  const [resultYouTubeId, setResultYouTubeId] = useState<string | undefined>(undefined);
   const [focusedClipId, setFocusedClipId] = useState<string | null>(null);
   const [clipPendingDelete, setClipPendingDelete] = useState<ClipItem | null>(null);
   const playToggleMapRef = useRef<Map<string, () => void>>(new Map());
@@ -256,11 +279,7 @@ export default function App() {
   useEffect(() => {
     if (clips.length === 0) return;
     const projectName =
-      clipSourceMode === 'youtube'
-        ? resultYouTubeId
-          ? `YouTube (${resultYouTubeId})`
-          : activeLink?.canonicalUrl || 'YouTube Project'
-        : video?.name || 'Local Video Project';
+      video?.name || driveRestoreMeta?.name || activeLink?.canonicalUrl || 'Clip Cutter Project';
 
     const readyCount = clips.filter((c) => c.cutStatus === 'done' && c.outputBlob).length;
     const avgScore = Math.round(
@@ -268,7 +287,7 @@ export default function App() {
     );
 
     const updated = saveRecentProjectSummary({
-      id: `${clipSourceMode}-${resultYouTubeId || video?.name || 'project'}`,
+      id: `${clipSourceMode}-${video?.fileHash || video?.name || driveRestoreMeta?.name || 'project'}`,
       name: projectName,
       updatedAt: Date.now(),
       clipCount: clips.length,
@@ -277,7 +296,7 @@ export default function App() {
       sourceMode: clipSourceMode,
     });
     if (updated.length > 0) setRecentProjects(updated);
-  }, [clips, clipSourceMode, resultYouTubeId, activeLink?.canonicalUrl, video?.name]);
+  }, [clips, clipSourceMode, activeLink?.canonicalUrl, video?.name, video?.fileHash, driveRestoreMeta?.name]);
 
   // Legal page navigation synced with URL hash
   const parseLegalHash = (): { open: boolean; section: LegalSectionId } => {
@@ -340,8 +359,8 @@ export default function App() {
 
   const isAnalyzing =
     phase === 'fetching-url' ||
-    phase === 'uploading' ||
-    phase === 'processing' ||
+    phase === 'extracting-audio' ||
+    phase === 'transcribing' ||
     phase === 'analyzing';
   const isCuttingAny = isCuttingAll || clips.some((c) => c.cutStatus === 'cutting');
   useEffect(() => {
@@ -376,11 +395,14 @@ export default function App() {
   const overlappingIds = useMemo(() => findOverlappingClipIds(clips), [clips]);
 
   const timelineTotalDuration = useMemo(() => {
-    if (clipSourceMode === 'file' && video?.durationSeconds) {
+    if (video?.durationSeconds) {
       return video.durationSeconds;
     }
+    if (driveRestoreMeta?.durationSeconds) {
+      return driveRestoreMeta.durationSeconds;
+    }
     return clips.reduce((max, c) => Math.max(max, c.end_seconds), 60);
-  }, [clipSourceMode, video?.durationSeconds, clips]);
+  }, [video?.durationSeconds, driveRestoreMeta?.durationSeconds, clips]);
 
   const revokeClipUrls = (items: ClipItem[]) => {
     items.forEach((item) => {
@@ -484,25 +506,42 @@ export default function App() {
         setSettings({
           ...DEFAULT_SETTINGS,
           ...saved.settings,
+          transcriptionEngine: saved.settings?.transcriptionEngine || 'cloud',
           aspectFormat: mergedAutoEdit.reframeVertical
             ? 'vertical'
             : saved.settings?.aspectFormat || 'original',
           autoEdit: mergedAutoEdit,
         });
         setAutoSaveWhenReady(saved.autoSaveWhenReady);
-        setInputMode(saved.inputMode);
-        setClipSourceMode(saved.clipSourceMode);
+        setInputMode(saved.inputMode === 'link' ? 'link' : 'file');
+        setClipSourceMode(saved.clipSourceMode === 'direct-url' ? 'direct-url' : 'file');
         setActiveLink(saved.activeLink ?? null);
-        setResultYouTubeId(saved.youtubeVideoId);
-        setGeminiSession(saved.geminiSession ?? null);
+        setLinkedDriveFile(saved.linkedDriveFile ?? null);
 
+        let hydratedHash = saved.fileHash;
         if (saved.sourceFile) {
           try {
             const inspected = await inspectLocalVideo(saved.sourceFile);
-            if (active) setVideo(inspected);
+            if (active) {
+              setVideo(inspected);
+              hydratedHash = inspected.fileHash || hydratedHash;
+            }
           } catch {
             // File may no longer be readable
           }
+        }
+
+        let hydratedTranscript: TranscriptSegment[] = Array.isArray(saved.cachedTranscript)
+          ? saved.cachedTranscript
+          : [];
+        if (hydratedTranscript.length === 0 && hydratedHash) {
+          const cachedRecord = await loadTranscriptFromIndexedDb(hydratedHash);
+          if (cachedRecord?.segments?.length) {
+            hydratedTranscript = cachedRecord.segments;
+          }
+        }
+        if (active) {
+          setCachedTranscript(hydratedTranscript);
         }
 
         const restoredClips: ClipItem[] = saved.clips.map((c) => {
@@ -576,8 +615,10 @@ export default function App() {
       autoSaveWhenReady,
       videoName: video?.name,
       videoSize: video?.sizeBytes,
+      fileHash: video?.fileHash,
+      transcriptLen: cachedTranscript.length,
+      driveFileId: linkedDriveFile?.id,
       linkUrl: activeLink?.canonicalUrl,
-      ytId: resultYouTubeId,
       clipsMeta: clips.map((c) => ({
         id: c.id,
         s: c.start_seconds,
@@ -593,6 +634,7 @@ export default function App() {
         hm: c.hookMovedToStart,
         desc: c.description,
         tags: c.hashtags,
+        vs: c.virality_score,
         hasBlob: Boolean(c.outputBlob),
       })),
     });
@@ -603,8 +645,10 @@ export default function App() {
     autoSaveWhenReady,
     video?.name,
     video?.sizeBytes,
+    video?.fileHash,
+    cachedTranscript.length,
+    linkedDriveFile?.id,
     activeLink?.canonicalUrl,
-    resultYouTubeId,
     clips,
   ]);
 
@@ -617,9 +661,10 @@ export default function App() {
       settings,
       autoSaveWhenReady,
       sourceFile: video?.file ?? null,
+      fileHash: video?.fileHash,
+      cachedTranscript,
       activeLink,
-      youtubeVideoId: resultYouTubeId,
-      geminiSession,
+      linkedDriveFile,
       clips: clips.map((c) => ({
         id: c.id,
         start_seconds: c.start_seconds,
@@ -802,52 +847,77 @@ export default function App() {
 
     try {
       const inspected = await inspectLocalVideo(file);
+      const cached = inspected.fileHash
+        ? await loadTranscriptFromIndexedDb(inspected.fileHash)
+        : null;
 
       if (video?.objectUrl) URL.revokeObjectURL(video.objectUrl);
-      if (geminiSession?.name) void deleteRemoteVideoFile(geminiSession.name);
-      revokeClipUrls(clips);
       clearFFmpegCache();
 
+      const isAttachingToDriveProject =
+        Boolean(driveRestoreMeta) && clipsRef.current.length > 0 && !video;
+
       setVideo(inspected);
-      setGeminiSession(null);
+      setExtractedAudioBlob(null);
       setAnalysisError(null);
       setTranslationError(null);
 
-      if (pendingReuseClips.length > 0) {
-        const maxDur = Math.floor(inspected.durationSeconds);
-        const clampedClips: ClipItem[] = pendingReuseClips
-          .map((clip, i) => {
-            const start = Math.max(
-              0,
-              Math.min(Math.max(0, maxDur - 1), Math.round(clip.start_seconds)),
-            );
-            const end = Math.max(start + 1, Math.min(maxDur, Math.round(clip.end_seconds)));
-            return {
-              ...clip,
-              id: `clip-${Date.now()}-${i}`,
-              start_seconds: start,
-              end_seconds: end,
-              cutStatus: 'idle' as const,
-              cutProgress: 0,
-              outputBlob: undefined,
-              outputUrl: undefined,
-              cutError: undefined,
-            };
-          })
-          .filter((c) => c.end_seconds - c.start_seconds >= 1);
+      if (isAttachingToDriveProject) {
+        const maxDur = Math.max(1, Math.floor(inspected.durationSeconds));
+        const sameHash =
+          !driveRestoreMeta?.fileHash ||
+          !inspected.fileHash ||
+          driveRestoreMeta.fileHash === inspected.fileHash;
 
-        setPendingReuseClips([]);
+        setClips((prev) =>
+          prev
+            .map((clip) => {
+              const start = Math.max(0, Math.min(Math.max(0, maxDur - 1), clip.start_seconds));
+              const end = Math.max(start + 1, Math.min(maxDur, clip.end_seconds));
+              return {
+                ...clip,
+                start_seconds: start,
+                end_seconds: end,
+                cutStatus: 'idle' as const,
+                cutProgress: 0,
+                outputBlob: undefined,
+                outputUrl: undefined,
+                cutError: undefined,
+              };
+            })
+            .filter((c) => c.end_seconds - c.start_seconds >= 1),
+        );
+
+        if (cached?.segments?.length && cachedTranscript.length === 0) {
+          setCachedTranscript(cached.segments);
+        }
+        setDriveRestoreMeta(null);
         setClipSourceMode('file');
-        setResultYouTubeId(undefined);
-        setClips(clampedClips);
         setPhase('ready');
 
-        if (clampedClips.length > 0) {
-          void cutClipListSequentially(inspected, clampedClips);
-        }
+        pushToast(
+          sameHash ? 'success' : 'info',
+          sameHash ? 'Local video re-attached' : 'Video attached (different file fingerprint)',
+          sameHash
+            ? 'Your Drive project clips and transcript are ready to cut.'
+            : 'Clips were clamped to the attached video length.',
+        );
       } else {
+        revokeClipUrls(clips);
         setClips([]);
+        setClipSourceMode('file');
+        setDriveRestoreMeta(null);
+        setLinkedDriveFile(null);
+        setCachedTranscript(cached?.segments || []);
         setPhase('idle');
+
+        if (cached?.segments?.length) {
+          pushToast(
+            'info',
+            'Cached transcript found',
+            'Reusing saved speech transcript from IndexedDB—zero transcription tokens needed.',
+          );
+        }
       }
     } catch (err) {
       setSelectionError(
@@ -856,36 +926,10 @@ export default function App() {
     }
   };
 
-  const handleLoadSampleVideo = async () => {
-    if (isLoadingSample || isAnalyzing || isCuttingAny) return;
-    setSelectionError(null);
-    setIsLoadingSample(true);
-    try {
-      const res = await fetch(SAMPLE_VIDEO_CONFIG.url);
-      if (!res.ok) {
-        throw new Error(`Sample video unavailable (HTTP ${res.status}).`);
-      }
-      const blob = await res.blob();
-      const sampleFile = new File([blob], SAMPLE_VIDEO_CONFIG.fileName, {
-        type: blob.type || 'video/mp4',
-      });
-      setInputMode('file');
-      await handleSelectFile(sampleFile);
-      pushToast('info', 'Sample video loaded', 'Pick settings or cut any range right away.');
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Unable to load sample video.';
-      setSelectionError(message);
-      pushToast('error', 'Could not load sample video', message);
-    } finally {
-      setIsLoadingSample(false);
-    }
-  };
-
   const handleClearVideo = () => {
     abortControllerRef.current?.abort();
     translateAbortRef.current?.abort();
     if (video?.objectUrl) URL.revokeObjectURL(video.objectUrl);
-    if (geminiSession?.name) void deleteRemoteVideoFile(geminiSession.name);
     revokeClipUrls(clips);
     clearFFmpegCache();
     void clearSessionFromIndexedDb();
@@ -894,13 +938,14 @@ export default function App() {
 
     setVideo(null);
     setActiveLink(null);
-    setPendingReuseClips([]);
-    setGeminiSession(null);
+    setExtractedAudioBlob(null);
+    setCachedTranscript([]);
+    setLinkedDriveFile(null);
+    setDriveRestoreMeta(null);
     setClips([]);
     setMomentCandidates([]);
     setAddedCandidateIds(new Set());
     setMomentSearchError(null);
-    setResultYouTubeId(undefined);
     setPhase('idle');
     setAnalysisError(null);
     setTranslationError(null);
@@ -913,7 +958,6 @@ export default function App() {
     setAnalysisError(null);
     setTranslationError(null);
     setGlobalFfmpegError(null);
-    setPendingReuseClips([]);
     setMomentCandidates([]);
     setAddedCandidateIds(new Set());
     setShowResumeBanner(false);
@@ -925,10 +969,6 @@ export default function App() {
     abortControllerRef.current?.abort();
     translateAbortRef.current?.abort();
     setActiveLink(null);
-    if (clipSourceMode === 'youtube') {
-      setClips([]);
-      setResultYouTubeId(undefined);
-    }
     setPhase('idle');
     setAnalysisError(null);
     setTranslationError(null);
@@ -997,13 +1037,17 @@ export default function App() {
     setTranslationError(null);
 
     try {
-      const translated = await translateClipsCaptions(
+      const res = await translateClipsCaptions(
         clipsRef.current,
         targetLanguage,
         controller.signal,
       );
-      setClips(translated);
-      void refreshUsage();
+      setClips(res.clips);
+      if (res.usage) {
+        setUsage(res.usage);
+      } else {
+        void refreshUsage();
+      }
       pushToast('success', `Translated captions to ${targetLanguage}`);
     } catch (err) {
       const appErr = err as AppError;
@@ -1025,8 +1069,8 @@ export default function App() {
     }
   };
 
-  // Flow 3: Analyze video via proxy
-  const runAnalysis = async (forceReupload = false) => {
+  // Flow 3: Audio extraction (16 kHz mono local) -> Transcription (cached / Cloud / Whisper) -> Text-only AI analysis
+  const runAnalysis = async (forceRetranscribe = false) => {
     requestNotificationPermissionOnce();
     abortControllerRef.current?.abort();
     const controller = new AbortController();
@@ -1037,36 +1081,19 @@ export default function App() {
     setGlobalFfmpegError(null);
     setShowResumeBanner(false);
     setFetchProgress(null);
-    setUploadProgress(0);
-    setRemoteFileState('');
+    setAudioExtractProgress(0);
+    setTranscribeStatusLabel('');
 
     try {
-      if (inputMode === 'link' && activeLink?.kind === 'youtube') {
-        setAnalysisMode('youtube');
-        setPhase('analyzing');
-
-        const generatedClips = await analyzeYouTubeForClips(
-          {
-            youtubeUrl: activeLink.canonicalUrl,
-            settings,
-          },
-          controller.signal,
-        );
-
-        revokeClipUrls(clips);
-        setClipSourceMode('youtube');
-        setResultYouTubeId(activeLink.youtubeVideoId);
-        setClips(generatedClips);
-        setPhase('ready');
-        void refreshUsage();
-        pushToast('success', `Found ${generatedClips.length} scored highlights`);
-        return;
-      }
-
       let targetVideo = video;
+      let targetSourceMode: ClipSourceMode = 'file';
+      let currentAudioBlob = extractedAudioBlob;
+      let activeTranscript: TranscriptSegment[] = forceRetranscribe ? [] : cachedTranscript;
+
       if (inputMode === 'link' && activeLink?.kind === 'direct') {
         setAnalysisMode('direct-url');
         setPhase('fetching-url');
+        targetSourceMode = 'direct-url';
 
         const fetchedFile = await fetchDirectVideoUrlInBrowser(
           activeLink.canonicalUrl,
@@ -1076,81 +1103,153 @@ export default function App() {
 
         const inspected = await inspectLocalVideo(fetchedFile);
         if (video?.objectUrl) URL.revokeObjectURL(video.objectUrl);
-        if (geminiSession?.name) void deleteRemoteVideoFile(geminiSession.name);
         clearFFmpegCache();
 
         targetVideo = inspected;
         setVideo(inspected);
-        setGeminiSession(null);
+        setExtractedAudioBlob(null);
+        currentAudioBlob = null;
+
+        if (!forceRetranscribe && inspected.fileHash) {
+          const cached = await loadTranscriptFromIndexedDb(inspected.fileHash);
+          if (cached?.segments?.length) {
+            activeTranscript = cached.segments;
+            setCachedTranscript(cached.segments);
+          }
+        }
       } else {
         setAnalysisMode('file');
       }
 
       if (!targetVideo) return;
 
-      let activeSession = forceReupload ? null : geminiSession;
+      // Double-check IndexedDB cache by fileHash if not yet in state
+      if (activeTranscript.length === 0 && !forceRetranscribe && targetVideo.fileHash) {
+        const cached = await loadTranscriptFromIndexedDb(targetVideo.fileHash);
+        if (cached?.segments?.length) {
+          activeTranscript = cached.segments;
+          setCachedTranscript(cached.segments);
+        }
+      }
 
-      if (!activeSession) {
-        setPhase('uploading');
-        const uploaded = await uploadVideoToGemini(
-          targetVideo.file,
-          (pct) => setUploadProgress(pct),
-          controller.signal,
-        );
+      // Enforce 45-minute cap when cloud transcription is selected and no transcript is cached yet
+      if (
+        activeTranscript.length === 0 &&
+        settings.transcriptionEngine === 'cloud' &&
+        targetVideo.isOverCloudTranscribeLimit
+      ) {
+        throw {
+          stage: 'transcribe',
+          code: 'DURATION_LIMIT',
+          message: `This video is ${formatTimecode(targetVideo.durationSeconds)}, which exceeds the 45-minute cloud audio limit. Switch on "On-device Whisper" in Clip settings or trim/cut custom clips manually.`,
+          retryable: false,
+        } satisfies AppError;
+      }
 
-        setPhase('processing');
-        setRemoteFileState(uploaded.state);
+      if (activeTranscript.length === 0) {
+        let audioMimeType = 'audio/ogg';
+        let audioFileName = 'speech-audio.ogg';
 
-        if (uploaded.state === 'ACTIVE') {
-          activeSession = {
-            name: uploaded.name,
-            uri: uploaded.uri,
-            mimeType: uploaded.mimeType,
-          };
+        if (!currentAudioBlob) {
+          setPhase('extracting-audio');
+          const extracted = await extractCompactAudioInBrowser(targetVideo.file, (pct) => {
+            setAudioExtractProgress(pct);
+          });
+          if (controller.signal.aborted) {
+            throw {
+              stage: 'extract-audio',
+              code: 'CANCELLED',
+              message: 'Audio extraction cancelled.',
+              retryable: true,
+            } satisfies AppError;
+          }
+          currentAudioBlob = extracted.blob;
+          audioMimeType = extracted.mimeType;
+          audioFileName = extracted.fileName;
+          setExtractedAudioBlob(extracted.blob);
+        }
+
+        setPhase('transcribing');
+        if (settings.transcriptionEngine === 'whisper') {
+          setTranscribeStatusLabel('Loading on-device Whisper speech model...');
+          activeTranscript = await transcribeWithWhisperInBrowser({
+            audioBlob: currentAudioBlob,
+            durationSeconds: targetVideo.durationSeconds,
+            captionLanguage: settings.captionLanguage,
+            onStatus: (label) => setTranscribeStatusLabel(label),
+            signal: controller.signal,
+          });
         } else {
-          activeSession = await waitForFileActive(
-            uploaded.name,
-            (state) => setRemoteFileState(state),
+          setTranscribeStatusLabel('Transcribing compressed speech audio via Gemini...');
+          const transcribed = await transcribeAudioBlobViaProxy(
+            {
+              audioBlob: new Blob([currentAudioBlob], { type: audioMimeType }),
+              fileName: audioFileName,
+              durationSeconds: targetVideo.durationSeconds,
+              captionLanguage: settings.captionLanguage,
+            },
             controller.signal,
           );
+          activeTranscript = transcribed.transcript;
+          if (transcribed.usage) setUsage(transcribed.usage);
         }
 
-        setGeminiSession(activeSession);
-      }
+        if (activeTranscript.length === 0) {
+          throw {
+            stage: 'transcribe',
+            code: 'EMPTY_TRANSCRIPT',
+            message:
+              'No spoken dialogue was detected in the extracted audio track. You can still use the manual clip creator below.',
+            retryable: true,
+          } satisfies AppError;
+        }
 
-      setPhase('analyzing');
-      let generatedClips: ClipItem[];
-
-      try {
-        generatedClips = await analyzeVideoForClips(
-          {
-            session: activeSession,
+        setCachedTranscript(activeTranscript);
+        if (targetVideo.fileHash) {
+          void saveTranscriptToIndexedDb({
+            fileHash: targetVideo.fileHash,
+            fileName: targetVideo.name,
             durationSeconds: targetVideo.durationSeconds,
-            settings,
-          },
-          controller.signal,
-        );
-      } catch (err) {
-        const appErr = err as AppError;
-        if (appErr?.code === 'FILE_EXPIRED' && !forceReupload) {
-          setGeminiSession(null);
-          await runAnalysis(true);
-          return;
+            engine: settings.transcriptionEngine,
+            language: settings.captionLanguage,
+            createdAt: Date.now(),
+            segments: activeTranscript,
+          });
         }
-        throw err;
       }
+
+      // Text-only highlight & virality analysis on the cached transcript
+      setPhase('analyzing');
+      const momentsRes = await findMomentsViaProxy(
+        {
+          transcript: activeTranscript,
+          durationSeconds: targetVideo.durationSeconds,
+          customPrompt: settings.customPrompt,
+          settings,
+          clipCount: settings.clipCount,
+        },
+        controller.signal,
+      );
 
       revokeClipUrls(clips);
-      setClipSourceMode('file');
-      setResultYouTubeId(undefined);
-      setClips(generatedClips);
+      setClipSourceMode(targetSourceMode);
+      setDriveRestoreMeta(null);
+      setClips(momentsRes.clips);
       setPhase('ready');
-      void refreshUsage();
-      pushToast('success', `Found ${generatedClips.length} viral clips with hooks & scores`);
+      if (momentsRes.usage) {
+        setUsage(momentsRes.usage);
+      } else {
+        void refreshUsage();
+      }
+      pushToast(
+        'success',
+        `Found ${momentsRes.clips.length} scored highlights`,
+        'Analyzed from cached speech text without uploading video.',
+      );
     } catch (err) {
       const appErr = err as AppError;
-      if (appErr?.code === 'CANCELLED') {
-        setPhase(clips.length > 0 ? 'ready' : 'idle');
+      if (appErr?.code === 'CANCELLED' || (err as Error)?.name === 'AbortError') {
+        setPhase(clipsRef.current.length > 0 ? 'ready' : 'idle');
         return;
       }
 
@@ -1158,7 +1257,8 @@ export default function App() {
         stage: appErr?.stage || 'analyze',
         code: appErr?.code || 'API_ERROR',
         message:
-          appErr?.message || 'Something went wrong while analyzing your video. Please retry.',
+          appErr?.message ||
+          (err instanceof Error ? err.message : 'Something went wrong while analyzing audio.'),
         retryable: appErr?.retryable !== false,
       });
       setPhase('error');
@@ -1169,27 +1269,32 @@ export default function App() {
     abortControllerRef.current?.abort();
   };
 
-  // Stage 1: Prompt-based moment search across video/transcript
+  // Prompt-based moment search across cached transcript (text-only)
   const handleSearchPromptMoments = async (promptText: string) => {
     setMomentSearchError(null);
-    setIsSearchingMoments(true);
 
-    const combinedTranscript: TranscriptSegment[] = clips
+    const combinedClipTranscript: TranscriptSegment[] = clips
       .flatMap((c) => c.transcript || [])
       .sort((a, b) => a.start_seconds - b.start_seconds);
+    const sourceTranscript =
+      cachedTranscript.length > 0 ? cachedTranscript : combinedClipTranscript;
 
+    if (sourceTranscript.length === 0) {
+      setMomentSearchError(
+        'No transcript is loaded yet. Run "Find best clips" first to extract and cache speech text.',
+      );
+      return;
+    }
+
+    setIsSearchingMoments(true);
     try {
       const res = await findMomentsViaProxy({
         customPrompt: promptText,
-        transcript: combinedTranscript.length > 0 ? combinedTranscript : undefined,
-        session: clipSourceMode === 'file' ? geminiSession : undefined,
-        youtubeUrl:
-          clipSourceMode === 'youtube' && activeLink?.kind === 'youtube'
-            ? activeLink.canonicalUrl
-            : undefined,
-        durationSeconds: clipSourceMode === 'file' ? video?.durationSeconds : undefined,
+        transcript: sourceTranscript,
+        durationSeconds: video?.durationSeconds || timelineTotalDuration,
         settings,
         clipCount: 5,
+        allowOverlaps: true,
       });
 
       setMomentCandidates(res.clips);
@@ -1208,7 +1313,7 @@ export default function App() {
 
   const handleAddCandidateMoment = (cand: ClipItem) => {
     const newId = `clip-moment-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-    const maxDur = clipSourceMode === 'file' && video?.durationSeconds ? Math.floor(video.durationSeconds) : undefined;
+    const maxDur = video?.durationSeconds ? Math.floor(video.durationSeconds) : undefined;
     const start = Math.max(0, Math.round(cand.start_seconds));
     const end = maxDur
       ? Math.min(maxDur, Math.max(start + 1, Math.round(cand.end_seconds)))
@@ -1224,7 +1329,7 @@ export default function App() {
     const unadded = momentCandidates.filter((c) => !addedCandidateIds.has(c.id));
     if (unadded.length === 0) return;
 
-    const maxDur = clipSourceMode === 'file' && video?.durationSeconds ? Math.floor(video.durationSeconds) : undefined;
+    const maxDur = video?.durationSeconds ? Math.floor(video.durationSeconds) : undefined;
     const mapped = unadded.map((cand, idx) => {
       const start = Math.max(0, Math.round(cand.start_seconds));
       const end = maxDur
@@ -1244,7 +1349,7 @@ export default function App() {
     pushToast('success', `Added ${mapped.length} moments to studio`);
   };
 
-  // Stage 1: Generate fresh Titles, Description & Hashtags on a clip
+  // Generate fresh Titles, Description & Hashtags on a clip
   const handleGenerateClipMetadata = async (
     clipId: string,
     platform: 'tiktok' | 'reels' | 'shorts' | 'youtube' | 'general',
@@ -1319,7 +1424,40 @@ export default function App() {
     }
   };
 
-  // Stage 1: Move hook to start & Toggle hook title card
+  // Batched virality scoring across all clips in one text-only request
+  const handleBatchScoreAll = async () => {
+    if (clipsRef.current.length === 0 || isBatchScoring) return;
+    setIsBatchScoring(true);
+    try {
+      const res = await scoreClipsBatchViaProxy(clipsRef.current);
+      const byId = new Map(res.scores.map((item) => [item.id, item]));
+      setClips((prev) =>
+        prev.map((c) => {
+          const updated = byId.get(c.id);
+          if (!updated) return c;
+          return {
+            ...c,
+            virality_score: updated.virality_score,
+            virality_reason: updated.virality_reason || c.virality_reason,
+            sub_scores: updated.sub_scores || c.sub_scores,
+          };
+        }),
+      );
+      if (res.usage) setUsage(res.usage);
+      pushToast(
+        'success',
+        `Scored ${res.scores.length} clips in 1 batch call`,
+        'Used text-only AI to minimize token quota.',
+      );
+    } catch (err) {
+      const appErr = err as AppError;
+      pushToast('error', 'Batch scoring failed', appErr?.message);
+    } finally {
+      setIsBatchScoring(false);
+    }
+  };
+
+  // Move hook to start & Toggle hook title card
   const handleMoveHookToStart = (clipId: string) => {
     setClips((prev) =>
       prev.map((clip) => {
@@ -1341,7 +1479,11 @@ export default function App() {
         };
       }),
     );
-    pushToast('info', 'Moved opening hook to clip start', 'Tap Cut & Edit to export with the new start.');
+    pushToast(
+      'info',
+      'Moved opening hook to clip start',
+      'Tap Cut & Edit to export with the new start.',
+    );
   };
 
   const handleToggleHookTitleCard = (clipId: string, nextValue: boolean) => {
@@ -1361,7 +1503,7 @@ export default function App() {
     );
   };
 
-  // Flow 4: Clip editing handlers
+  // Clip editing handlers
   const handleUpdateClipTitle = (clipId: string, title: string) => {
     setClips((prev) =>
       prev.map((clip) => (clip.id === clipId ? { ...clip, title } : clip)),
@@ -1410,7 +1552,7 @@ export default function App() {
   };
 
   const handleBulkAdjustTimings = (startDelta: number, endDelta: number) => {
-    const maxDur = clipSourceMode === 'file' ? video?.durationSeconds : undefined;
+    const maxDur = video?.durationSeconds ?? driveRestoreMeta?.durationSeconds;
     revokeClipUrls(clips);
     setClips((prev) =>
       prev.map((clip) => {
@@ -1451,25 +1593,6 @@ export default function App() {
       return next;
     });
   }, []);
-
-  const handleCutYouTubeClipsFromFile = () => {
-    setPendingReuseClips(clips);
-    setClips([]);
-    setResultYouTubeId(undefined);
-    setPhase('idle');
-    setAnalysisError(null);
-    setShowResumeBanner(false);
-    setInputMode('file');
-
-    if (video?.objectUrl) {
-      URL.revokeObjectURL(video.objectUrl);
-      setVideo(null);
-    }
-    if (geminiSession?.name) {
-      void deleteRemoteVideoFile(geminiSession.name);
-      setGeminiSession(null);
-    }
-  };
 
   // Flow 5: Cut & Auto-Edit single clip
   const runCutSingleClipObject = async (
@@ -1624,8 +1747,6 @@ export default function App() {
     };
 
     const nextIndex = clipsRef.current.length;
-    setClipSourceMode('file');
-    setResultYouTubeId(undefined);
     setClips((prev) => [...prev, newClip]);
     setPhase('ready');
     setFocusedClipId(newId);
@@ -1647,19 +1768,16 @@ export default function App() {
     await cutClipListSequentially(video, clips);
   };
 
-  const handleNudgeFocusedStart = useCallback(
-    (clipId: string, delta: number) => {
-      const target = clipsRef.current.find((c) => c.id === clipId);
-      if (!target || target.cutStatus === 'cutting' || target.cutStatus === 'queued') return;
-      const nextStart = Math.round(
-        Math.max(0, Math.min(target.end_seconds - 1, target.start_seconds + delta)) * 10,
-      ) / 10;
-      if (nextStart !== target.start_seconds) {
-        handleUpdateClipTimes(clipId, nextStart, target.end_seconds);
-      }
-    },
-    [],
-  );
+  const handleNudgeFocusedStart = useCallback((clipId: string, delta: number) => {
+    const target = clipsRef.current.find((c) => c.id === clipId);
+    if (!target || target.cutStatus === 'cutting' || target.cutStatus === 'queued') return;
+    const nextStart =
+      Math.round(Math.max(0, Math.min(target.end_seconds - 1, target.start_seconds + delta)) * 10) /
+      10;
+    if (nextStart !== target.start_seconds) {
+      handleUpdateClipTimes(clipId, nextStart, target.end_seconds);
+    }
+  }, []);
 
   useStudioKeyboardShortcuts({
     enabled:
@@ -1668,6 +1786,7 @@ export default function App() {
       !isShortcutsOpen &&
       !isTourOpen &&
       !isFeedbackOpen &&
+      !isDriveModalOpen &&
       !clipPendingDelete &&
       clips.length > 0,
     focusedClipId,
@@ -1676,7 +1795,7 @@ export default function App() {
     },
     onRequestDeleteFocused: handleRequestDeleteClip,
     onBulkCut: () => {
-      if (clipSourceMode === 'file' && video && !isCuttingRef.current && !isAnalyzing) {
+      if (video && !isCuttingRef.current && !isAnalyzing) {
         void cutClipListSequentially(video, clipsRef.current);
       }
     },
@@ -1686,7 +1805,7 @@ export default function App() {
 
   const handleResumeSession = () => {
     setShowResumeBanner(false);
-    if (clipSourceMode === 'file' && video) {
+    if (video) {
       const uncut = clips.filter((c) => c.cutStatus !== 'done');
       if (uncut.length > 0 && !isCuttingAny) {
         void cutClipListSequentially(video, clips);
@@ -1707,9 +1826,7 @@ export default function App() {
         'Includes all finished MP4 clips and .SRT subtitles.',
       );
     } catch (err) {
-      setGlobalFfmpegError(
-        err instanceof Error ? err.message : 'Failed to package ZIP archive.',
-      );
+      setGlobalFfmpegError(err instanceof Error ? err.message : 'Failed to package ZIP archive.');
     } finally {
       setIsZipping(false);
     }
@@ -1717,27 +1834,146 @@ export default function App() {
 
   const handleExportSceneBreakdownJson = () => {
     if (clips.length === 0) return;
-    const sourceName =
-      clipSourceMode === 'youtube'
-        ? resultYouTubeId
-          ? `youtube-${resultYouTubeId}`
-          : 'youtube-clips'
-        : video?.name || 'clip-cutter';
+    const sourceName = video?.name || driveRestoreMeta?.name || 'clip-cutter';
     downloadSceneBreakdownJson({
       clips,
       sourceMode: clipSourceMode,
       sourceName,
-      totalDurationSeconds: clipSourceMode === 'file' ? video?.durationSeconds : undefined,
+      totalDurationSeconds: video?.durationSeconds ?? driveRestoreMeta?.durationSeconds,
       captionLanguage: settings.captionLanguage,
     });
     pushToast('success', 'Scene breakdown exported as JSON');
   };
+
+  // Google Drive Snapshot builder & restore handler
+  const buildCurrentDriveSnapshot = useCallback((): DriveProjectSnapshot | null => {
+    if (video) {
+      return buildDriveProjectSnapshot({
+        video,
+        settings,
+        cachedTranscript,
+        clips,
+        directUrl: activeLink?.canonicalUrl,
+      });
+    }
+    if (driveRestoreMeta && clips.length > 0) {
+      const syntheticVideo: VideoAsset = {
+        file: new File([], driveRestoreMeta.name),
+        objectUrl: '',
+        name: driveRestoreMeta.name,
+        sizeBytes: driveRestoreMeta.sizeBytes,
+        durationSeconds: driveRestoreMeta.durationSeconds,
+        width: driveRestoreMeta.width,
+        height: driveRestoreMeta.height,
+        fileHash: driveRestoreMeta.fileHash,
+        isLargeFile: driveRestoreMeta.sizeBytes > 500 * 1024 * 1024,
+        isOverDurationLimit: driveRestoreMeta.durationSeconds > 30 * 60,
+        isOverCloudTranscribeLimit: driveRestoreMeta.durationSeconds > 45 * 60,
+      };
+      return buildDriveProjectSnapshot({
+        video: syntheticVideo,
+        settings,
+        cachedTranscript,
+        clips,
+        directUrl: driveRestoreMeta.directUrl || activeLink?.canonicalUrl,
+      });
+    }
+    return null;
+  }, [video, driveRestoreMeta, settings, cachedTranscript, clips, activeLink?.canonicalUrl]);
+
+  const handleRestoreFromDriveSnapshot = useCallback(
+    (snapshot: DriveProjectSnapshot, pickedFile: LinkedDriveFile) => {
+      const mergedAutoEdit: AutoEditSettings = {
+        ...DEFAULT_AUTO_EDIT,
+        ...snapshot.settings?.autoEdit,
+      };
+      setSettings({
+        ...DEFAULT_SETTINGS,
+        ...snapshot.settings,
+        transcriptionEngine: snapshot.settings?.transcriptionEngine || 'cloud',
+        aspectFormat: mergedAutoEdit.reframeVertical
+          ? 'vertical'
+          : snapshot.settings?.aspectFormat || 'original',
+        autoEdit: mergedAutoEdit,
+      });
+
+      const restoredTranscript = Array.isArray(snapshot.cachedTranscript)
+        ? snapshot.cachedTranscript
+        : [];
+      setCachedTranscript(restoredTranscript);
+
+      if (snapshot.videoMeta?.fileHash && restoredTranscript.length > 0) {
+        void saveTranscriptToIndexedDb({
+          fileHash: snapshot.videoMeta.fileHash,
+          fileName: snapshot.videoMeta.name,
+          durationSeconds: snapshot.videoMeta.durationSeconds,
+          engine: snapshot.settings?.transcriptionEngine || 'cloud',
+          language: snapshot.settings?.captionLanguage || 'English',
+          createdAt: snapshot.savedAt || Date.now(),
+          segments: restoredTranscript,
+        });
+      }
+
+      const restoredClips: ClipItem[] = snapshot.clips.map((c) => ({
+        ...c,
+        cutStatus: 'idle',
+        cutProgress: 0,
+        outputBlob: undefined,
+        outputUrl: undefined,
+        cutError: undefined,
+      }));
+
+      revokeClipUrls(clipsRef.current);
+      setClips(restoredClips);
+      setLinkedDriveFile(pickedFile);
+      setShowResumeBanner(false);
+      setAnalysisError(null);
+      setGlobalFfmpegError(null);
+      setPhase(restoredClips.length > 0 ? 'ready' : 'idle');
+
+      // Check whether the currently open local video matches the restored Drive project
+      const matchesCurrentVideo = Boolean(
+        video &&
+          ((snapshot.videoMeta?.fileHash &&
+            video.fileHash &&
+            snapshot.videoMeta.fileHash === video.fileHash) ||
+            (video.name === snapshot.videoMeta?.name &&
+              video.sizeBytes === snapshot.videoMeta?.sizeBytes)),
+      );
+
+      if (matchesCurrentVideo) {
+        setDriveRestoreMeta(null);
+      } else {
+        if (video?.objectUrl) URL.revokeObjectURL(video.objectUrl);
+        setVideo(null);
+        setExtractedAudioBlob(null);
+        clearFFmpegCache();
+        setDriveRestoreMeta(snapshot.videoMeta);
+
+        if (snapshot.videoMeta?.directUrl) {
+          setInputMode('link');
+          setClipSourceMode('direct-url');
+          setActiveLink({
+            kind: 'direct',
+            rawUrl: snapshot.videoMeta.directUrl,
+            canonicalUrl: snapshot.videoMeta.directUrl,
+          });
+        } else {
+          setInputMode('file');
+          setClipSourceMode('file');
+          setActiveLink(null);
+        }
+      }
+    },
+    [video],
+  );
 
   const hasSelectedSource =
     (inputMode === 'file' && Boolean(video)) ||
     (inputMode === 'link' && Boolean(activeLink));
 
   const remainingToCutCount = clips.filter((c) => c.cutStatus !== 'done').length;
+  const canCutLocally = Boolean(video);
 
   const handleClearAllLocalData = async () => {
     handleClearVideo();
@@ -1756,6 +1992,8 @@ export default function App() {
           isLegalOpen={isLegalOpen}
           theme={theme}
           usage={usage}
+          linkedDriveFile={linkedDriveFile}
+          onOpenDriveSync={() => setIsDriveModalOpen(true)}
           onToggleTheme={handleToggleTheme}
           onResetVideo={handleClearVideo}
           onOpenLegal={() => openLegalPage('terms')}
@@ -1775,7 +2013,7 @@ export default function App() {
           </div>
         ) : (
           <>
-            {showAllTimelines && clips.length > 0 && (clipSourceMode === 'youtube' || Boolean(video)) && (
+            {showAllTimelines && clips.length > 0 && (
               <AllTimelinesStrip
                 clips={clips}
                 totalDuration={timelineTotalDuration}
@@ -1791,6 +2029,38 @@ export default function App() {
             )}
 
             <main className="mx-auto w-full max-w-6xl flex-1 space-y-6 px-4 pb-28 pt-6 sm:px-6 sm:pt-8 md:pb-14">
+              {/* Drive Project Restored Without Local Video File */}
+              {driveRestoreMeta && !video && clips.length > 0 && (
+                <div
+                  role="status"
+                  className="flex flex-col gap-3 rounded-xl border border-[#E8A33D]/50 bg-white p-4 sm:flex-row sm:items-center sm:justify-between dark:bg-[#151517]"
+                >
+                  <div className="flex items-start gap-3">
+                    <Cloud className="mt-0.5 h-5 w-5 shrink-0 text-[#E8A33D]" aria-hidden="true" />
+                    <div className="space-y-0.5">
+                      <p className="font-display text-sm font-semibold text-[#151517] dark:text-[#F2F0EA]">
+                        Project restored from Google Drive ({clips.length} clips)
+                      </p>
+                      <p className="text-xs leading-relaxed text-[#64625D] dark:text-[#8C8C93]">
+                        Select the local video file{' '}
+                        <strong className="font-mono text-[#151517] dark:text-[#F2F0EA]">
+                          {driveRestoreMeta.name}
+                        </strong>{' '}
+                        below to re-attach it for preview and MP4 cutting.
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setDriveRestoreMeta(null)}
+                    aria-label="Dismiss Drive restore notice"
+                    className="flex min-h-[40px] min-w-[40px] shrink-0 items-center justify-center self-end rounded-lg text-[#64625D] hover:bg-[#EFECE4] sm:self-center dark:text-[#8C8C93] dark:hover:bg-[#1C1C1F]"
+                  >
+                    <X className="h-4 w-4" />
+                  </button>
+                </div>
+              )}
+
               {/* Session Restored Banner */}
               {showResumeBanner && clips.length > 0 && (
                 <div
@@ -1803,14 +2073,14 @@ export default function App() {
                     </p>
                     <p className="font-mono text-xs tabular-nums text-[#64625D] dark:text-[#8C8C93]">
                       {cutCount} of {clips.length} clips finished
-                      {remainingToCutCount > 0 && clipSourceMode === 'file' && video
+                      {remainingToCutCount > 0 && video
                         ? ` · ${remainingToCutCount} remaining to cut`
                         : ''}
                     </p>
                   </div>
 
                   <div className="flex shrink-0 items-center gap-2">
-                    {clipSourceMode === 'file' && video && remainingToCutCount > 0 && (
+                    {video && remainingToCutCount > 0 && (
                       <button
                         type="button"
                         onClick={handleResumeSession}
@@ -1841,7 +2111,7 @@ export default function App() {
                 </div>
               )}
 
-              {/* Flow 1: Upload / Paste Link */}
+              {/* Flow 1: Upload / Direct URL / Open from Drive */}
               <UploadZone
                 inputMode={inputMode}
                 onModeChange={(mode) => {
@@ -1851,9 +2121,7 @@ export default function App() {
                 }}
                 video={video}
                 activeLink={activeLink}
-                pendingReuseCount={pendingReuseClips.length}
                 isBusy={isAnalyzing || isCuttingAny}
-                isLoadingSample={isLoadingSample}
                 selectionError={selectionError}
                 recentProjects={recentProjects}
                 onClearRecentProjects={() => {
@@ -1861,20 +2129,16 @@ export default function App() {
                   setRecentProjects([]);
                 }}
                 onSelectFile={handleSelectFile}
-                onTrySampleVideo={() => void handleLoadSampleVideo()}
+                onOpenFromDrive={() => setIsDriveModalOpen(true)}
                 onSubmitLink={handleSelectLink}
                 onClearLink={handleClearLink}
                 onClearSelectionError={() => setSelectionError(null)}
                 onClearVideo={handleClearVideo}
-                onDismissPendingReuse={() => setPendingReuseClips([])}
               />
 
               {/* Landing / Showcase Sections when no source is loaded */}
               {!video && !activeLink && clips.length === 0 && phase === 'idle' && (
-                <LandingSections
-                  onTrySampleVideo={() => void handleLoadSampleVideo()}
-                  isLoadingSample={isLoadingSample}
-                />
+                <LandingSections />
               )}
 
               {/* Flow 2: Settings before analysis */}
@@ -1883,6 +2147,8 @@ export default function App() {
                   settings={settings}
                   disabled={isAnalyzing || isCuttingAny}
                   hasClips={clips.length > 0}
+                  hasCachedTranscript={cachedTranscript.length > 0}
+                  isOverCloudCap={Boolean(video?.isOverCloudTranscribeLimit)}
                   isTranslatingCaptions={isTranslatingCaptions}
                   translationError={translationError}
                   onChange={handleSettingsChange}
@@ -1905,7 +2171,7 @@ export default function App() {
               )}
 
               {/* Custom Any-Length Clip Creator */}
-              {inputMode === 'file' && video && (
+              {video && (
                 <CustomClipCreator
                   video={video}
                   autoEdit={settings.autoEdit}
@@ -1924,16 +2190,17 @@ export default function App() {
                 />
               )}
 
-              {/* Flow 3: Upload / Processing / Analysis Progress */}
+              {/* Flow 3: Audio Extraction / Transcription / Text-only Analysis Progress */}
               <AnalysisProgress
                 phase={phase}
                 analysisMode={analysisMode}
+                transcriptionEngine={settings.transcriptionEngine}
                 fetchProgress={fetchProgress}
-                uploadProgress={uploadProgress}
-                remoteFileState={remoteFileState}
+                audioExtractProgress={audioExtractProgress}
+                transcribeStatusLabel={transcribeStatusLabel}
                 error={analysisError}
                 onCancel={handleCancelAnalysis}
-                onRetry={() => void runAnalysis(analysisError?.code === 'FILE_EXPIRED')}
+                onRetry={() => void runAnalysis(false)}
                 onSwitchToUpload={() => {
                   setAnalysisError(null);
                   setPhase('idle');
@@ -1948,13 +2215,17 @@ export default function App() {
                   className="flex flex-col gap-3 rounded-xl border border-red-500/40 bg-white p-4 sm:flex-row sm:items-center sm:justify-between dark:bg-[#151517]"
                 >
                   <div className="flex items-start gap-3">
-                    <AlertCircle className="mt-0.5 h-5 w-5 shrink-0 text-red-600 dark:text-red-400" aria-hidden="true" />
+                    <AlertCircle
+                      className="mt-0.5 h-5 w-5 shrink-0 text-red-600 dark:text-red-400"
+                      aria-hidden="true"
+                    />
                     <p className="text-sm text-[#151517] dark:text-[#F2F0EA]">{globalFfmpegError}</p>
                   </div>
                   <button
                     type="button"
                     onClick={() => void handleCutAllClips()}
-                    className="inline-flex min-h-[44px] shrink-0 items-center justify-center gap-2 rounded-lg bg-[#E8A33D] px-4 py-2 text-sm font-semibold text-[#0E0E0F] hover:bg-[#DDA03A] whitespace-nowrap"
+                    disabled={!canCutLocally}
+                    className="inline-flex min-h-[44px] shrink-0 items-center justify-center gap-2 rounded-lg bg-[#E8A33D] px-4 py-2 text-sm font-semibold text-[#0E0E0F] hover:bg-[#DDA03A] disabled:opacity-40 whitespace-nowrap"
                   >
                     <RefreshCw className="h-4 w-4" aria-hidden="true" />
                     <span>Retry cut</span>
@@ -1962,31 +2233,34 @@ export default function App() {
                 </div>
               )}
 
-              {/* Flow 4, 5 & 6: Stage 1 AI Workspace, Waveform Scrubber, Insights & Clip Cards */}
-              {clips.length > 0 && (clipSourceMode === 'youtube' || Boolean(video)) && (
+              {/* Flow 4, 5 & 6: AI Workspace, Waveform Scrubber, Insights & Clip Cards */}
+              {clips.length > 0 && (
                 <section aria-label="Clip results" className="space-y-5">
                   <StudioActionBar
-                    sourceMode={clipSourceMode}
                     totalClips={clips.length}
                     cutCount={cutCount}
+                    canCutLocally={canCutLocally}
                     autoSaveWhenReady={autoSaveWhenReady}
                     showAllTimelines={showAllTimelines}
                     isCuttingAll={isCuttingAll}
                     isRegenerating={isAnalyzing}
+                    isBatchScoring={isBatchScoring}
                     isZipping={isZipping}
                     zipProgress={zipProgress}
+                    driveLinkedName={linkedDriveFile?.name}
                     onToggleAutoSave={setAutoSaveWhenReady}
                     onToggleShowAllTimelines={() => setShowAllTimelines((prev) => !prev)}
                     onOpenBulkAdjust={() => setIsBulkAdjustOpen(true)}
                     onOpenMobileSettings={() => setIsMobileSettingsOpen(true)}
                     onExportJson={handleExportSceneBreakdownJson}
+                    onBatchScoreAll={() => void handleBatchScoreAll()}
+                    onOpenDriveSync={() => setIsDriveModalOpen(true)}
                     onRegenerate={() => void runAnalysis(false)}
                     onCutAll={() => void handleCutAllClips()}
                     onSaveAll={() => void handleSaveAllZip()}
-                    onSwitchToUploadCut={handleCutYouTubeClipsFromFile}
                   />
 
-                  {/* Stage 1 Prompt-Based Moment Finder */}
+                  {/* Prompt-Based Moment Finder (Text-only over cached transcript) */}
                   <PromptMomentsBar
                     disabled={isAnalyzing || isCuttingAny}
                     isSearching={isSearchingMoments}
@@ -2002,10 +2276,12 @@ export default function App() {
                     }}
                   />
 
-                  {/* Stage 1 Clip Insights & Engagement Breakdown */}
+                  {/* Clip Insights & Engagement Breakdown */}
                   <ClipInsightsPanel
                     clips={clips}
-                    sourceDurationSeconds={clipSourceMode === 'file' ? video?.durationSeconds : undefined}
+                    sourceDurationSeconds={
+                      video?.durationSeconds ?? driveRestoreMeta?.durationSeconds
+                    }
                     onSelectClip={(clipId) => {
                       setFocusedClipId(clipId);
                       document
@@ -2014,10 +2290,11 @@ export default function App() {
                     }}
                   />
 
-                  {/* Focused Clip Interactive Waveform Timeline (File Mode) */}
-                  {clipSourceMode === 'file' && video && focusedClip && (
+                  {/* Focused Clip Interactive Waveform Timeline (reuses extracted audio when present) */}
+                  {video && focusedClip && (
                     <WaveformTimeline
                       video={video}
+                      extractedAudioBlob={extractedAudioBlob}
                       clip={focusedClip}
                       clipIndex={focusedClipIndex}
                       disabled={isCuttingAny}
@@ -2026,18 +2303,16 @@ export default function App() {
                   )}
 
                   {/* Desktop Auto-Edit Pipeline & Caption Presets */}
-                  {clipSourceMode === 'file' && (
-                    <div className="hidden md:block">
-                      <AutoEditToggles
-                        autoEdit={settings.autoEdit}
-                        disabled={isAnalyzing || isCuttingAny}
-                        hasBrandLogo={Boolean(brandSettings.logoBlob)}
-                        brandApplyToAll={brandSettings.applyToAllClips}
-                        onToggle={handleToggleAutoEdit}
-                        onSelectCaptionPreset={handleSelectCaptionPreset}
-                      />
-                    </div>
-                  )}
+                  <div className="hidden md:block">
+                    <AutoEditToggles
+                      autoEdit={settings.autoEdit}
+                      disabled={isAnalyzing || isCuttingAny}
+                      hasBrandLogo={Boolean(brandSettings.logoBlob)}
+                      brandApplyToAll={brandSettings.applyToAllClips}
+                      onToggle={handleToggleAutoEdit}
+                      onSelectCaptionPreset={handleSelectCaptionPreset}
+                    />
+                  </div>
 
                   <div className="grid grid-cols-1 gap-5 md:grid-cols-2 lg:grid-cols-3">
                     {clips.map((clip, index) => (
@@ -2045,10 +2320,9 @@ export default function App() {
                         key={clip.id}
                         clip={clip}
                         index={index}
-                        sourceMode={clipSourceMode}
                         sourceVideoUrl={video?.objectUrl}
-                        youtubeVideoId={resultYouTubeId}
-                        videoDuration={clipSourceMode === 'file' ? video?.durationSeconds : undefined}
+                        canCutLocally={canCutLocally}
+                        videoDuration={video?.durationSeconds ?? driveRestoreMeta?.durationSeconds}
                         timelineTotalDuration={timelineTotalDuration}
                         aspectFormat={settings.aspectFormat}
                         currentAutoEdit={settings.autoEdit}
@@ -2079,25 +2353,17 @@ export default function App() {
                     ))}
                   </div>
 
-                  {clipSourceMode === 'youtube' && (
-                    <div className="flex flex-col gap-4 rounded-xl border border-[#DFDCD2] bg-white p-5 sm:flex-row sm:items-center sm:justify-between dark:border-[#2A2A2E] dark:bg-[#151517]">
+                  {!video && (
+                    <div className="flex flex-col gap-3 rounded-xl border border-[#DFDCD2] bg-white p-4 sm:flex-row sm:items-center sm:justify-between dark:border-[#2A2A2E] dark:bg-[#151517]">
                       <div className="flex items-start gap-3">
-                        <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-[#E8A33D]/40 bg-[#E8A33D]/10 text-[#E8A33D]">
-                          <Scissors className="h-4 w-4" aria-hidden="true" />
-                        </span>
-                        <p className="max-w-2xl text-sm leading-relaxed text-[#64625D] dark:text-[#8C8C93]">
-                          To get downloadable clips, upload the video file in the Upload tab and the timestamps will be reused to cut it.
+                        <FolderOpen
+                          className="mt-0.5 h-4 w-4 shrink-0 text-[#E8A33D]"
+                          aria-hidden="true"
+                        />
+                        <p className="text-xs leading-relaxed text-[#64625D] dark:text-[#8C8C93]">
+                          Re-attach the source video file above to preview playback and cut downloadable MP4 clips locally in your browser.
                         </p>
                       </div>
-
-                      <button
-                        type="button"
-                        onClick={handleCutYouTubeClipsFromFile}
-                        className="inline-flex min-h-[44px] shrink-0 items-center justify-center gap-2 rounded-lg bg-[#E8A33D] px-5 py-2.5 text-sm font-semibold text-[#0E0E0F] transition-colors hover:bg-[#DDA03A] whitespace-nowrap"
-                      >
-                        <Upload className="h-4 w-4" aria-hidden="true" />
-                        <span>Cut these clips from my file</span>
-                      </button>
                     </div>
                   )}
                 </section>
@@ -2110,9 +2376,12 @@ export default function App() {
         <footer className="border-t border-[#DFDCD2] bg-[#F7F5F0] dark:border-[#2A2A2E] dark:bg-[#0E0E0F]">
           <div className="mx-auto flex max-w-6xl flex-col gap-3 px-4 py-6 text-xs text-[#64625D] sm:flex-row sm:items-center sm:justify-between sm:px-6 dark:text-[#8C8C93]">
             <span>
-              Videos are cut on your device; audio is sent securely only for AI transcription with your consent.
+              Videos are cut on your device; compact speech audio is transcribed only with your action or locally via Whisper.
             </span>
-            <nav aria-label="Footer navigation" className="flex flex-wrap items-center gap-x-5 gap-y-2">
+            <nav
+              aria-label="Footer navigation"
+              className="flex flex-wrap items-center gap-x-5 gap-y-2"
+            >
               {(
                 [
                   ['terms', 'Terms'],
@@ -2181,11 +2450,27 @@ export default function App() {
         </div>
       )}
 
+      {/* Google Drive Project Sync Modal */}
+      <GoogleDriveSyncModal
+        isOpen={isDriveModalOpen}
+        onClose={() => setIsDriveModalOpen(false)}
+        authUser={driveAuthUser}
+        onAuthUserChange={setDriveAuthUser}
+        linkedDriveFile={linkedDriveFile}
+        onLinkedDriveFileChange={setLinkedDriveFile}
+        canSaveCurrentProject={Boolean(video || (driveRestoreMeta && clips.length > 0))}
+        defaultVideoName={video?.name || driveRestoreMeta?.name || 'clip-cutter-project'}
+        clipCount={clips.length}
+        buildSnapshot={buildCurrentDriveSnapshot}
+        onRestoreSnapshot={handleRestoreFromDriveSnapshot}
+        onToast={(msg) => pushToast('success', msg)}
+      />
+
       {/* Bulk Adjust Timings Modal */}
       <BulkAdjustDialog
         isOpen={isBulkAdjustOpen}
         clips={clips}
-        maxDurationSeconds={clipSourceMode === 'file' ? video?.durationSeconds : undefined}
+        maxDurationSeconds={video?.durationSeconds ?? driveRestoreMeta?.durationSeconds}
         onClose={() => setIsBulkAdjustOpen(false)}
         onApply={handleBulkAdjustTimings}
       />

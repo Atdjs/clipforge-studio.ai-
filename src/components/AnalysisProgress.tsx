@@ -1,12 +1,13 @@
 import { AlertCircle, CheckCircle2, Loader2, RefreshCw, Upload, X } from 'lucide-react';
-import type { AnalysisPhase, AppError } from '../types/clip';
+import type { AnalysisPhase, AppError, TranscriptionEngine } from '../types/clip';
 
 interface AnalysisProgressProps {
   phase: AnalysisPhase;
-  analysisMode: 'file' | 'youtube' | 'direct-url';
+  analysisMode: 'file' | 'direct-url';
+  transcriptionEngine: TranscriptionEngine;
   fetchProgress: number | null;
-  uploadProgress: number;
-  remoteFileState: string;
+  audioExtractProgress: number;
+  transcribeStatusLabel: string;
   error: AppError | null;
   onCancel: () => void;
   onRetry: () => void;
@@ -14,15 +15,16 @@ interface AnalysisProgressProps {
 }
 
 /**
- * Step 3 UI: Progress bar for Fetching -> Uploading -> Waiting -> Gemini Analysis,
- * skeleton preview cards while analyzing, and clean error recovery.
+ * Step 3 UI: Progress tracker for Direct URL Fetch -> Local Audio Extraction (16kHz mono) ->
+ * Transcription (Cloud Audio or On-Device Whisper) -> Text-only Gemini Highlight Analysis.
  */
 export function AnalysisProgress({
   phase,
   analysisMode,
+  transcriptionEngine,
   fetchProgress,
-  uploadProgress,
-  remoteFileState,
+  audioExtractProgress,
+  transcribeStatusLabel,
   error,
   onCancel,
   onRetry,
@@ -53,14 +55,16 @@ export function AnalysisProgress({
             <div className="space-y-1">
               <h3 className="font-display text-base font-semibold text-[#151517] dark:text-[#F2F0EA]">
                 {error.code === 'RATE_LIMIT' || error.code === 'QUOTA_EXCEEDED'
-                  ? 'Usage limit reached'
+                  ? 'Daily AI usage limit reached'
                   : error.code === 'AUTH_ERROR'
                     ? 'API configuration required'
                     : error.code === 'CORS_ERROR'
                       ? 'Direct link blocked by CORS'
                       : 'Could not complete analysis'}
               </h3>
-              <p className="text-sm leading-relaxed text-[#64625D] dark:text-[#8C8C93]">{error.message}</p>
+              <p className="text-sm leading-relaxed text-[#64625D] dark:text-[#8C8C93]">
+                {error.message}
+              </p>
             </div>
           </div>
 
@@ -69,7 +73,7 @@ export function AnalysisProgress({
               <button
                 type="button"
                 onClick={onSwitchToUpload}
-                className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-lg bg-[#E8A33D] px-5 py-2.5 text-sm font-semibold text-[#0E0E0F] transition-colors hover:bg-[#DDA03A] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#E8A33D] whitespace-nowrap"
+                className="inline-flex min-h-[44px] items-center justify-center gap-2 whitespace-nowrap rounded-lg bg-[#E8A33D] px-5 py-2.5 text-sm font-semibold text-[#0E0E0F] transition-colors hover:bg-[#DDA03A] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#E8A33D]"
               >
                 <Upload className="h-4 w-4" aria-hidden="true" />
                 <span>Upload file instead</span>
@@ -80,7 +84,7 @@ export function AnalysisProgress({
               <button
                 type="button"
                 onClick={onRetry}
-                className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-lg bg-[#E8A33D] px-5 py-2.5 text-sm font-semibold text-[#0E0E0F] transition-colors hover:bg-[#DDA03A] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#E8A33D] whitespace-nowrap"
+                className="inline-flex min-h-[44px] items-center justify-center gap-2 whitespace-nowrap rounded-lg bg-[#E8A33D] px-5 py-2.5 text-sm font-semibold text-[#0E0E0F] transition-colors hover:bg-[#DDA03A] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#E8A33D]"
               >
                 <RefreshCw className="h-4 w-4" aria-hidden="true" />
                 <span>Retry</span>
@@ -92,12 +96,12 @@ export function AnalysisProgress({
     );
   }
 
-  const fileSteps: { key: AnalysisPhase; label: string; detail: string }[] = [
+  const steps: { key: AnalysisPhase; label: string; detail: string }[] = [
     ...(analysisMode === 'direct-url'
       ? [
           {
             key: 'fetching-url' as AnalysisPhase,
-            label: 'Fetching video from URL in browser',
+            label: 'Fetching direct video URL in browser',
             detail:
               fetchProgress !== null
                 ? `${fetchProgress}% downloaded`
@@ -106,41 +110,39 @@ export function AnalysisProgress({
         ]
       : []),
     {
-      key: 'uploading',
-      label: 'Uploading video in 8 MB chunks',
-      detail: `${uploadProgress}% transferred to AI proxy`,
+      key: 'extracting-audio',
+      label: 'Extracting 16 kHz mono audio locally',
+      detail: `${audioExtractProgress}% processed in Web Worker (no video upload)`,
     },
     {
-      key: 'processing',
-      label: 'Preparing video stream',
-      detail: `File state: ${remoteFileState || 'PROCESSING'} (waiting for ACTIVE)`,
+      key: 'transcribing',
+      label:
+        transcriptionEngine === 'whisper'
+          ? 'Transcribing speech on-device (Whisper)'
+          : 'Transcribing compressed audio via Gemini',
+      detail:
+        transcribeStatusLabel ||
+        (transcriptionEngine === 'whisper'
+          ? 'Running local speech model in browser...'
+          : 'Sending compact speech audio & caching transcript...'),
     },
     {
       key: 'analyzing',
-      label: 'Scoring hooks & viral moments',
-      detail: 'Scanning hooks, transcripts, and virality scores with Gemini',
+      label: 'Finding & scoring highlights (text-only)',
+      detail: 'Selecting hooks, transcripts, and virality scores from cached text',
     },
   ];
 
-  const youtubeSteps: { key: AnalysisPhase; label: string; detail: string }[] = [
-    {
-      key: 'analyzing',
-      label: 'Analyzing YouTube video with Gemini',
-      detail: 'Finding hooks, timestamps, and engagement scores directly from the link',
-    },
-  ];
-
-  const steps = analysisMode === 'youtube' ? youtubeSteps : fileSteps;
   const activeIndex = steps.findIndex((s) => s.key === phase);
 
   const overallPct =
-    phase === 'uploading'
-      ? Math.max(5, Math.round(uploadProgress * 0.6))
-      : phase === 'fetching-url'
-        ? Math.max(5, Math.round((fetchProgress ?? 20) * 0.25))
-        : phase === 'processing'
-          ? 70
-          : 88;
+    phase === 'fetching-url'
+      ? Math.max(5, Math.round((fetchProgress ?? 20) * 0.2))
+      : phase === 'extracting-audio'
+        ? Math.max(12, Math.round(15 + audioExtractProgress * 0.35))
+        : phase === 'transcribing'
+          ? 65
+          : 90;
 
   return (
     <div className="space-y-4">
@@ -156,10 +158,10 @@ export function AnalysisProgress({
             </div>
             <div>
               <h3 className="font-display text-base font-semibold text-[#151517] dark:text-[#F2F0EA]">
-                Analyzing your video
+                Analyzing speech &amp; highlights
               </h3>
               <p className="mt-0.5 text-sm text-[#64625D] dark:text-[#8C8C93]">
-                Keep this tab open while AI scores your best moments.
+                Keep this tab open while transcript and moments finish processing.
               </p>
             </div>
           </div>
@@ -167,19 +169,24 @@ export function AnalysisProgress({
           <button
             type="button"
             onClick={onCancel}
-            className="inline-flex min-h-[44px] items-center gap-1.5 rounded-lg border border-[#DFDCD2] bg-[#EFECE4] px-3.5 py-2 text-xs font-medium text-[#151517] transition-colors hover:border-[#64625D] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#E8A33D] dark:border-[#2A2A2E] dark:bg-[#1C1C1F] dark:text-[#F2F0EA] dark:hover:border-[#8C8C93] whitespace-nowrap"
+            className="inline-flex min-h-[44px] items-center gap-1.5 whitespace-nowrap rounded-lg border border-[#DFDCD2] bg-[#EFECE4] px-3.5 py-2 text-xs font-medium text-[#151517] transition-colors hover:border-[#64625D] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#E8A33D] dark:border-[#2A2A2E] dark:bg-[#1C1C1F] dark:text-[#F2F0EA] dark:hover:border-[#8C8C93]"
           >
             <X className="h-4 w-4" aria-hidden="true" />
             <span>Cancel</span>
           </button>
         </div>
 
-        {(phase === 'uploading' || (phase === 'fetching-url' && fetchProgress !== null)) && (
+        {(phase === 'extracting-audio' ||
+          (phase === 'fetching-url' && fetchProgress !== null)) && (
           <div className="mt-4 space-y-1.5">
             <div className="h-1.5 w-full overflow-hidden rounded-full bg-[#EFECE4] dark:bg-[#1C1C1F]">
               <div
                 className="h-full rounded-full bg-[#E8A33D] transition-[width] duration-200 motion-reduce:transition-none"
-                style={{ width: `${phase === 'uploading' ? uploadProgress : fetchProgress}%` }}
+                style={{
+                  width: `${
+                    phase === 'extracting-audio' ? audioExtractProgress : fetchProgress
+                  }%`,
+                }}
               />
             </div>
           </div>
@@ -194,7 +201,10 @@ export function AnalysisProgress({
               <li key={step.key} className="flex items-start gap-3">
                 <div className="mt-0.5 shrink-0">
                   {isComplete ? (
-                    <CheckCircle2 className="h-5 w-5 text-emerald-600 dark:text-emerald-400" aria-hidden="true" />
+                    <CheckCircle2
+                      className="h-5 w-5 text-emerald-600 dark:text-emerald-400"
+                      aria-hidden="true"
+                    />
                   ) : isCurrent ? (
                     <Loader2 className="h-5 w-5 animate-spin text-[#E8A33D]" aria-hidden="true" />
                   ) : (
@@ -207,11 +217,9 @@ export function AnalysisProgress({
                 <div className="min-w-0 flex-1">
                   <p
                     className={`text-sm font-medium ${
-                      isCurrent
+                      isCurrent || isComplete
                         ? 'text-[#151517] dark:text-[#F2F0EA]'
-                        : isComplete
-                          ? 'text-[#151517] dark:text-[#F2F0EA]'
-                          : 'text-[#64625D] dark:text-[#8C8C93]'
+                        : 'text-[#64625D] dark:text-[#8C8C93]'
                     }`}
                   >
                     {step.label}

@@ -57,6 +57,11 @@ interface HookTitleCardPayload {
 
 type WorkerRequest =
   | {
+      type: 'extract-audio';
+      id: string;
+      file: File;
+    }
+  | {
       type: 'cut';
       id: string;
       file: File;
@@ -494,6 +499,118 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
   if (msg.type === 'clear') {
     if (ffmpegCore) {
       unmountOrDeletePreviousInput(ffmpegCore);
+    }
+    return;
+  }
+
+  if (msg.type === 'extract-audio') {
+    const { id, file } = msg;
+    const safeId = id.replace(/[^a-zA-Z0-9_-]/g, '');
+    const tempOutputs: string[] = [];
+
+    try {
+      activeCutId = id;
+      activeStageLabel = 'Extracting speech audio (16 kHz mono)...';
+      progressRange = [5, 95];
+      self.postMessage({ type: 'progress', id, progress: 5, stage: activeStageLabel });
+
+      const core = await getFFmpegCore();
+      const inputPath = await ensureSourceMounted(core, file);
+
+      const candidates = [
+        {
+          codec: 'libopus',
+          ext: 'ogg',
+          mimeType: 'audio/ogg',
+          extraArgs: ['-b:a', '32k', '-vbr', 'on', '-application', 'voip'],
+        },
+        {
+          codec: 'libmp3lame',
+          ext: 'mp3',
+          mimeType: 'audio/mpeg',
+          extraArgs: ['-b:a', '32k'],
+        },
+        {
+          codec: 'aac',
+          ext: 'm4a',
+          mimeType: 'audio/mp4',
+          extraArgs: ['-b:a', '32k'],
+        },
+      ];
+
+      let chosenBuffer: Uint8Array | null = null;
+      let chosenMime = 'audio/ogg';
+      let chosenFileName = 'speech-audio.ogg';
+      let lastError = 'Could not extract audio track from video.';
+
+      for (const candidate of candidates) {
+        const outPath = `/audio_${safeId}.${candidate.ext}`;
+        tempOutputs.push(outPath);
+
+        const exitCode = core.exec(
+          '-i',
+          inputPath,
+          '-vn',
+          '-ac',
+          '1',
+          '-ar',
+          '16000',
+          '-c:a',
+          candidate.codec,
+          ...candidate.extraArgs,
+          '-y',
+          outPath,
+        );
+        core.reset();
+
+        if (exitCode === 0) {
+          try {
+            const raw = core.FS.readFile(outPath);
+            if (raw && raw.byteLength > 256) {
+              chosenBuffer = new Uint8Array(raw.byteLength);
+              chosenBuffer.set(raw);
+              chosenMime = candidate.mimeType;
+              chosenFileName = `speech-audio.${candidate.ext}`;
+              break;
+            }
+          } catch {
+            // Try next fallback codec
+          }
+        } else {
+          lastError = `FFmpeg audio extraction failed with code ${exitCode} (${candidate.codec}). The video may have no audio track.`;
+        }
+      }
+
+      if (!chosenBuffer) {
+        throw new Error(lastError);
+      }
+
+      self.postMessage(
+        {
+          type: 'audio-done',
+          id,
+          buffer: chosenBuffer.buffer,
+          mimeType: chosenMime,
+          fileName: chosenFileName,
+        },
+        [chosenBuffer.buffer],
+      );
+    } catch (err) {
+      if (ffmpegCore) {
+        try {
+          ffmpegCore.reset();
+        } catch {
+          // Ignore reset error
+        }
+      }
+      const errorMessage =
+        err instanceof Error ? err.message : 'Failed to extract audio from video in browser.';
+      self.postMessage({ type: 'error', id, error: errorMessage });
+    } finally {
+      activeCutId = null;
+      if (ffmpegCore) {
+        tempOutputs.forEach((p) => safeUnlink(ffmpegCore!, p));
+      }
     }
     return;
   }

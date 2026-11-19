@@ -9,10 +9,10 @@ const QUOTA_WINDOW_MS = 24 * 60 * 60 * 1000;
 export const AI_CREDIT_COSTS = {
   transcribe: 2,
   findMoments: 3,
-  analyze: 3,
   generateMetadata: 1,
   translate: 1,
   scoreClip: 1,
+  scoreBatch: 1,
 } as const;
 
 interface CreditBucket {

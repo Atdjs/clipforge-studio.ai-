@@ -4,15 +4,12 @@ import {
   type CaptionLanguage,
   type ClipItem,
   type ClipSettings,
-  type GeminiFileSession,
   MAX_UPLOAD_BYTES,
   MAX_UPLOAD_MB,
   type ServerUsageStatus,
   type TranscriptSegment,
   type ViralitySubScores,
 } from '../types/clip';
-
-const UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024; // 8 MB slices keep browser memory flat on 1 GB files
 
 interface RawClipResponse {
   start_seconds: number;
@@ -33,8 +30,21 @@ interface RawClipResponse {
 }
 
 /**
- * Helper to create a structured AppError from any API/network failure.
+ * In-flight request deduplication so rapid double-clicks reuse the same network Promise.
  */
+const inFlightRequests = new Map<string, Promise<unknown>>();
+
+function dedupInFlight<T>(key: string, factory: () => Promise<T>): Promise<T> {
+  const existing = inFlightRequests.get(key) as Promise<T> | undefined;
+  if (existing) return existing;
+
+  const promise = factory().finally(() => {
+    inFlightRequests.delete(key);
+  });
+  inFlightRequests.set(key, promise);
+  return promise;
+}
+
 function toAppError(
   stage: AppError['stage'],
   payload: Partial<{ code: string; message: string; retryable: boolean }>,
@@ -48,9 +58,6 @@ function toAppError(
   };
 }
 
-/**
- * Map raw server clip objects into client ClipItem records.
- */
 function mapRawClips(
   rawClips: RawClipResponse[],
   captionLanguage: CaptionLanguage,
@@ -68,7 +75,9 @@ function mapRawClips(
         ? Math.max(0.15, Math.min(0.85, clip.speaker_x_ratio))
         : 0.5,
     virality_score:
-      typeof clip.virality_score === 'number' ? Math.max(0, Math.min(100, Math.round(clip.virality_score))) : 75,
+      typeof clip.virality_score === 'number'
+        ? Math.max(0, Math.min(100, Math.round(clip.virality_score)))
+        : 75,
     virality_reason: clip.virality_reason || clip.hook_reason,
     sub_scores: clip.sub_scores,
     hook_line: clip.hook_line,
@@ -85,9 +94,8 @@ function mapRawClips(
 }
 
 /**
- * Try fetching a direct .mp4 / .mov URL in the browser.
- * If the remote server blocks cross-origin requests (CORS), throws a clear error
- * asking the user to download and upload the file instead.
+ * Fetch a direct .mp4 / .mov URL in the browser.
+ * Remote server must allow CORS; HTML or non-media URLs are rejected cleanly.
  */
 export async function fetchDirectVideoUrlInBrowser(
   url: string,
@@ -99,14 +107,18 @@ export async function fetchDirectVideoUrlInBrowser(
     response = await fetch(url, { mode: 'cors', signal });
   } catch (err) {
     if ((err as Error)?.name === 'AbortError') {
-      throw toAppError('fetch', { code: 'CANCELLED', message: 'Link fetch cancelled.', retryable: true }, 'Cancelled.');
+      throw toAppError(
+        'fetch',
+        { code: 'CANCELLED', message: 'Link fetch cancelled.', retryable: true },
+        'Cancelled.',
+      );
     }
     throw toAppError(
       'fetch',
       {
         code: 'CORS_ERROR',
         message:
-          'Could not fetch this video URL in the browser because the host blocks cross-origin requests (CORS) or is unreachable. Please download the video and upload the file in the "Upload file" tab instead.',
+          'Could not fetch this video URL in the browser because the host blocks cross-origin requests (CORS) or is unreachable. Please download the MP4/MOV file and upload it in the "Upload file" tab.',
         retryable: false,
       },
       'CORS blocked video fetch.',
@@ -118,7 +130,7 @@ export async function fetchDirectVideoUrlInBrowser(
       'fetch',
       {
         code: 'FETCH_HTTP_ERROR',
-        message: `Could not fetch video URL (HTTP ${response.status}). Please download the file and upload it in the "Upload file" tab instead.`,
+        message: `Could not fetch video URL (HTTP ${response.status}). Please download the file and upload it directly.`,
         retryable: false,
       },
       'Failed to fetch video URL.',
@@ -139,14 +151,13 @@ export async function fetchDirectVideoUrlInBrowser(
       {
         code: 'NOT_A_VIDEO',
         message:
-          'This link did not return a direct MP4 or MOV video stream. Please use a direct .mp4 URL, a public YouTube link, or upload the file directly.',
+          'This link did not return a direct MP4 or MOV video stream. Please paste a direct .mp4/.mov URL or upload the video file.',
         retryable: false,
       },
       'URL did not return a video.',
     );
   }
 
-  // Enforce 1 GB (1024 MB) limit during streamed URL download
   const contentLengthHeader = response.headers.get('content-length');
   const totalBytes = contentLengthHeader ? Number(contentLengthHeader) : 0;
   if (totalBytes > MAX_UPLOAD_BYTES) {
@@ -154,7 +165,7 @@ export async function fetchDirectVideoUrlInBrowser(
       'fetch',
       {
         code: 'FILE_TOO_LARGE',
-        message: `Remote video exceeds the 1 GB (${MAX_UPLOAD_MB} MB) maximum upload limit.`,
+        message: `Remote video exceeds the 1 GB (${MAX_UPLOAD_MB} MB) maximum size.`,
         retryable: false,
       },
       'Remote video exceeds 1 GB limit.',
@@ -178,7 +189,7 @@ export async function fetchDirectVideoUrlInBrowser(
             'fetch',
             {
               code: 'FILE_TOO_LARGE',
-              message: `Remote video exceeds the 1 GB (${MAX_UPLOAD_MB} MB) maximum upload limit.`,
+              message: `Remote video exceeds the 1 GB (${MAX_UPLOAD_MB} MB) maximum size.`,
               retryable: false,
             },
             'Remote video exceeds 1 GB limit.',
@@ -203,7 +214,7 @@ export async function fetchDirectVideoUrlInBrowser(
         'fetch',
         {
           code: 'FILE_TOO_LARGE',
-          message: `Remote video exceeds the 1 GB (${MAX_UPLOAD_MB} MB) maximum upload limit.`,
+          message: `Remote video exceeds the 1 GB (${MAX_UPLOAD_MB} MB) maximum size.`,
           retryable: false,
         },
         'Remote video exceeds 1 GB limit.',
@@ -219,472 +230,288 @@ export async function fetchDirectVideoUrlInBrowser(
 }
 
 /**
- * Step 2A: Stream the video file in 8 MB slices to the server, which forwards it to
- * Gemini's Files API. Keeps memory flat even on 1 GB (1024 MB) files and updates progress smoothly.
+ * Send only the compact 16 kHz mono extracted audio Blob in a single request to /api/transcribe.
+ * Video bytes are never uploaded.
  */
-export async function uploadVideoToGemini(
-  file: File,
-  onProgress: (percent: number) => void,
+export async function transcribeAudioBlobViaProxy(
+  params: {
+    audioBlob: Blob;
+    fileName: string;
+    durationSeconds: number;
+    captionLanguage: CaptionLanguage;
+  },
   signal?: AbortSignal,
-): Promise<GeminiFileSession & { state: string }> {
-  if (file.size > MAX_UPLOAD_BYTES) {
-    throw toAppError(
-      'upload',
-      {
-        code: 'FILE_TOO_LARGE',
-        message: `Video file exceeds the 1 GB (${MAX_UPLOAD_MB} MB) maximum upload limit.`,
-        retryable: false,
-      },
-      'File exceeds 1 GB upload limit.',
-    );
-  }
+): Promise<{ transcript: TranscriptSegment[]; usage?: ServerUsageStatus }> {
+  const dedupKey = `transcribe:${params.fileName}:${params.audioBlob.size}:${Math.round(
+    params.durationSeconds,
+  )}:${params.captionLanguage}`;
 
-  let uploadId = '';
+  return dedupInFlight(dedupKey, async () => {
+    const formData = new FormData();
+    formData.append('audio', params.audioBlob, params.fileName);
+    formData.append('durationSeconds', String(Math.round(params.durationSeconds * 10) / 10));
+    formData.append('captionLanguage', params.captionLanguage);
 
-  const cleanupRemoteChunks = () => {
-    if (!uploadId) return;
-    const idToClean = uploadId;
-    uploadId = '';
-    void fetch(`/api/videos/upload/${encodeURIComponent(idToClean)}`, { method: 'DELETE' }).catch(
-      () => {},
-    );
-  };
-
-  try {
-    onProgress(0);
-
-    // 1. Initialize chunked upload session
-    const initRes = await fetch('/api/videos/upload/init', {
+    const res = await fetch('/api/transcribe', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
       signal,
-      body: JSON.stringify({
-        fileName: file.name,
-        fileSize: file.size,
-        mimeType: file.type,
-      }),
-    });
-
-    const initBody = await initRes.json().catch(() => ({}));
-    if (!initRes.ok) {
-      throw toAppError('upload', initBody, 'Could not start video upload.');
-    }
-    uploadId = String(initBody.uploadId || '');
-
-    // 2. Stream 8 MB File.slice chunks sequentially so the UI never freezes
-    let offset = 0;
-    while (offset < file.size) {
-      if (signal?.aborted) {
-        throw new DOMException('Aborted', 'AbortError');
-      }
-
-      const end = Math.min(file.size, offset + UPLOAD_CHUNK_BYTES);
-      const chunkBlob = file.slice(offset, end);
-
-      const chunkRes = await fetch(
-        `/api/videos/upload/chunk?uploadId=${encodeURIComponent(uploadId)}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/octet-stream' },
-          body: chunkBlob,
-          signal,
-        },
-      );
-
-      if (!chunkRes.ok) {
-        const errBody = await chunkRes.json().catch(() => ({}));
-        throw toAppError('upload', errBody, `Upload failed during chunk transfer (HTTP ${chunkRes.status}).`);
-      }
-
-      offset = end;
-      // Reserve 95..100% for server->Gemini handoff
-      const pct = Math.min(95, Math.round((offset / file.size) * 95));
-      onProgress(pct);
-    }
-
-    // 3. Finalize & push assembled file to Gemini Files API
-    const completeRes = await fetch('/api/videos/upload/complete', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      signal,
-      body: JSON.stringify({ uploadId }),
-    });
-    uploadId = ''; // Server consumes and deletes the temp file on complete
-
-    const completeBody = await completeRes.json().catch(() => ({}));
-    if (!completeRes.ok) {
-      throw toAppError('upload', completeBody, 'Failed to finalize upload to Gemini Files API.');
-    }
-
-    onProgress(100);
-    return {
-      name: String(completeBody.name || ''),
-      uri: String(completeBody.uri || ''),
-      mimeType: String(completeBody.mimeType || 'video/mp4'),
-      state: String(completeBody.state || 'PROCESSING'),
-    };
-  } catch (err) {
-    cleanupRemoteChunks();
-    if ((err as Error)?.name === 'AbortError') {
-      throw toAppError(
-        'upload',
-        { code: 'CANCELLED', message: 'Upload cancelled.', retryable: true },
-        'Upload cancelled.',
-      );
-    }
-    if ((err as AppError)?.stage) {
-      throw err;
-    }
-    throw toAppError(
-      'upload',
-      {
-        code: 'NETWORK_ERROR',
-        message: 'Network connection lost during upload. Please check your connection and retry.',
-        retryable: true,
-      },
-      'Network error during upload.',
-    );
-  }
-}
-
-/**
- * Step 2B: Poll Gemini Files API status until the uploaded video reaches state === "ACTIVE".
- */
-export async function waitForFileActive(
-  fileName: string,
-  onStatusUpdate: (stateLabel: string) => void,
-  signal?: AbortSignal,
-): Promise<GeminiFileSession> {
-  const maxAttempts = 120; // Up to ~6 minutes for very large 30-min videos
-
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    if (signal?.aborted) {
-      throw toAppError('processing', { code: 'CANCELLED', message: 'Processing cancelled.', retryable: true }, 'Cancelled.');
-    }
-
-    const res = await fetch(`/api/videos/status?name=${encodeURIComponent(fileName)}`, {
-      signal,
+      body: formData,
     }).catch((err) => {
       if (err?.name === 'AbortError') {
-        throw toAppError('processing', { code: 'CANCELLED', message: 'Processing cancelled.', retryable: true }, 'Cancelled.');
+        throw toAppError(
+          'transcribe',
+          { code: 'CANCELLED', message: 'Transcription cancelled.', retryable: true },
+          'Cancelled.',
+        );
       }
       throw toAppError(
-        'processing',
-        { code: 'NETWORK_ERROR', message: 'Connection interrupted while checking Gemini file status.', retryable: true },
-        'Network error checking file status.',
+        'transcribe',
+        { code: 'NETWORK_ERROR', message: 'Could not reach /api/transcribe.', retryable: true },
+        'Network error.',
       );
     });
 
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
-      throw toAppError('processing', data, 'Failed while checking video processing status.');
+      throw toAppError('transcribe', data, 'Failed to transcribe extracted audio.');
     }
 
-    const state = String(data.state || 'PROCESSING');
-    onStatusUpdate(state);
-
-    if (state === 'ACTIVE') {
-      return {
-        name: String(data.name || fileName),
-        uri: String(data.uri || ''),
-        mimeType: String(data.mimeType || 'video/mp4'),
-      };
-    }
-
-    if (state === 'FAILED') {
-      throw toAppError(
-        'processing',
-        {
-          code: 'PROCESSING_FAILED',
-          message: 'Gemini could not process this video file. Try re-encoding as standard H.264 MP4.',
-          retryable: true,
-        },
-        'Video processing failed.',
-      );
-    }
-
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(resolve, 3000);
-      signal?.addEventListener(
-        'abort',
-        () => {
-          clearTimeout(timer);
-          reject(
-            toAppError('processing', { code: 'CANCELLED', message: 'Processing cancelled.', retryable: true }, 'Cancelled.'),
-          );
-        },
-        { once: true },
-      );
-    });
-  }
-
-  throw toAppError(
-    'processing',
-    { code: 'TIMEOUT', message: 'Video processing took too long to become active. Please try again.', retryable: true },
-    'Processing timed out.',
-  );
-}
-
-/**
- * Step 2C (File Mode): Ask Gemini Flash (gemini-4-hydrogen) to find non-overlapping highlight clips.
- */
-export async function analyzeVideoForClips(
-  params: {
-    session: GeminiFileSession;
-    durationSeconds: number;
-    settings: ClipSettings;
-  },
-  signal?: AbortSignal,
-): Promise<ClipItem[]> {
-  const res = await fetch('/api/videos/analyze', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    signal,
-    body: JSON.stringify({
-      fileUri: params.session.uri,
-      mimeType: params.session.mimeType,
-      durationSeconds: params.durationSeconds,
-      clipCount: params.settings.clipCount,
-      lengthRange: params.settings.lengthRange,
-      aspectFormat: params.settings.aspectFormat,
-      customPrompt: params.settings.customPrompt,
-      captionLanguage: params.settings.captionLanguage,
-    }),
-  }).catch((err) => {
-    if (err?.name === 'AbortError') {
-      throw toAppError('analyze', { code: 'CANCELLED', message: 'Analysis cancelled.', retryable: true }, 'Cancelled.');
-    }
-    throw toAppError(
-      'analyze',
-      { code: 'NETWORK_ERROR', message: 'Could not reach analysis server. Please retry.', retryable: true },
-      'Network error during analysis.',
-    );
-  });
-
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    throw toAppError('analyze', data, 'Gemini analysis failed.');
-  }
-
-  const rawClips: RawClipResponse[] = Array.isArray(data.clips) ? data.clips : [];
-  return mapRawClips(rawClips, params.settings.captionLanguage, params.settings.autoEdit);
-}
-
-/**
- * Step 2C (YouTube Link Mode): Pass a public YouTube URL directly to Gemini Flash as file_uri
- * using the exact same JSON response schema.
- */
-export async function analyzeYouTubeForClips(
-  params: {
-    youtubeUrl: string;
-    settings: ClipSettings;
-  },
-  signal?: AbortSignal,
-): Promise<ClipItem[]> {
-  const res = await fetch('/api/videos/analyze', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    signal,
-    body: JSON.stringify({
-      youtubeUrl: params.youtubeUrl,
-      clipCount: params.settings.clipCount,
-      lengthRange: params.settings.lengthRange,
-      aspectFormat: params.settings.aspectFormat,
-      customPrompt: params.settings.customPrompt,
-      captionLanguage: params.settings.captionLanguage,
-    }),
-  }).catch((err) => {
-    if (err?.name === 'AbortError') {
-      throw toAppError('analyze', { code: 'CANCELLED', message: 'Analysis cancelled.', retryable: true }, 'Cancelled.');
-    }
-    throw toAppError(
-      'analyze',
-      { code: 'NETWORK_ERROR', message: 'Could not reach analysis server. Please retry.', retryable: true },
-      'Network error during YouTube analysis.',
-    );
-  });
-
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    throw toAppError('analyze', data, 'Gemini could not analyze this YouTube video. Make sure it is public.');
-  }
-
-  const rawClips: RawClipResponse[] = Array.isArray(data.clips) ? data.clips : [];
-  return mapRawClips(rawClips, params.settings.captionLanguage, params.settings.autoEdit);
-}
-
-/**
- * Translate existing clips' captions and phrase-level transcripts when the user changes caption language.
- */
-export async function translateClipsCaptions(
-  clips: ClipItem[],
-  targetLanguage: CaptionLanguage,
-  signal?: AbortSignal,
-): Promise<ClipItem[]> {
-  const res = await fetch('/api/clips/translate', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    signal,
-    body: JSON.stringify({
-      targetLanguage,
-      clips: clips.map((c) => ({
-        id: c.id,
-        caption_text: c.caption_text,
-        transcript: (c.transcript || []).map((t) => ({
-          start_seconds: t.start_seconds,
-          end_seconds: t.end_seconds,
-          text: t.text,
-        })),
-      })),
-    }),
-  }).catch((err) => {
-    if (err?.name === 'AbortError') {
-      throw toAppError('analyze', { code: 'CANCELLED', message: 'Translation cancelled.', retryable: true }, 'Cancelled.');
-    }
-    throw toAppError(
-      'analyze',
-      { code: 'NETWORK_ERROR', message: 'Could not reach translation server. Please retry.', retryable: true },
-      'Network error during caption translation.',
-    );
-  });
-
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    throw toAppError('analyze', data, 'Could not translate captions. Please retry.');
-  }
-
-  const translations = Array.isArray(data.translations)
-    ? (data.translations as Array<{ id: string; caption_text: string; transcript_texts: string[] }>)
-    : [];
-  const byId = new Map(translations.map((item) => [item.id, item]));
-
-  return clips.map((clip) => {
-    const tr = byId.get(clip.id);
-    if (!tr) return clip;
     return {
-      ...clip,
-      caption_text: tr.caption_text || clip.caption_text,
-      captionLanguage: targetLanguage,
-      transcript: (clip.transcript || []).map((seg, i) => ({
-        ...seg,
-        text: tr.transcript_texts?.[i] || seg.text,
-      })),
+      transcript: Array.isArray(data.transcript) ? (data.transcript as TranscriptSegment[]) : [],
+      usage: data.usage as ServerUsageStatus | undefined,
     };
   });
 }
 
 /**
- * Best-effort cleanup of the remote Gemini file when the user resets or replaces the video.
- */
-export async function deleteRemoteVideoFile(fileName?: string): Promise<void> {
-  if (!fileName) return;
-  try {
-    await fetch(`/api/videos/file?name=${encodeURIComponent(fileName)}`, {
-      method: 'DELETE',
-    });
-  } catch {
-    // Non-critical cleanup
-  }
-}
-
-/**
- * Fetch current server-enforced AI credit quota status.
- */
-export async function fetchServerUsage(): Promise<ServerUsageStatus | null> {
-  try {
-    const res = await fetch('/api/usage');
-    if (!res.ok) return null;
-    return (await res.json()) as ServerUsageStatus;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Proxy call to /api/transcribe for full timestamped speech transcription.
- */
-export async function transcribeVideoViaProxy(
-  params: {
-    session: GeminiFileSession;
-    durationSeconds?: number;
-    captionLanguage: CaptionLanguage;
-  },
-  signal?: AbortSignal,
-): Promise<{ transcript: TranscriptSegment[]; usage?: ServerUsageStatus }> {
-  const res = await fetch('/api/transcribe', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    signal,
-    body: JSON.stringify({
-      fileUri: params.session.uri,
-      mimeType: params.session.mimeType,
-      durationSeconds: params.durationSeconds,
-      captionLanguage: params.captionLanguage,
-    }),
-  });
-
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    throw toAppError('analyze', data, 'Failed to transcribe video.');
-  }
-
-  return {
-    transcript: Array.isArray(data.transcript) ? (data.transcript as TranscriptSegment[]) : [],
-    usage: data.usage as ServerUsageStatus | undefined,
-  };
-}
-
-/**
- * Proxy call to /api/find-moments for prompt-based searching across transcript or video.
+ * Text-only highlight & prompt moment detection on top of the cached transcript.
  */
 export async function findMomentsViaProxy(
   params: {
+    transcript: TranscriptSegment[];
+    durationSeconds: number;
     customPrompt: string;
-    transcript?: TranscriptSegment[];
-    session?: GeminiFileSession | null;
-    youtubeUrl?: string;
-    durationSeconds?: number;
     settings: ClipSettings;
     clipCount?: number;
+    allowOverlaps?: boolean;
   },
   signal?: AbortSignal,
 ): Promise<{ clips: ClipItem[]; usage?: ServerUsageStatus }> {
-  const res = await fetch('/api/find-moments', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    signal,
-    body: JSON.stringify({
-      fileUri: params.session?.uri,
-      mimeType: params.session?.mimeType,
-      youtubeUrl: params.youtubeUrl,
-      transcript: params.transcript?.map((t) => ({
-        start_seconds: t.start_seconds,
-        end_seconds: t.end_seconds,
-        text: t.text,
-      })),
-      durationSeconds: params.durationSeconds,
-      customPrompt: params.customPrompt,
-      clipCount: params.clipCount ?? 5,
-      lengthRange: params.settings.lengthRange,
-      captionLanguage: params.settings.captionLanguage,
-    }),
-  }).catch((err) => {
-    if (err?.name === 'AbortError') {
-      throw toAppError('analyze', { code: 'CANCELLED', message: 'Moment search cancelled.', retryable: true }, 'Cancelled.');
-    }
-    throw toAppError('analyze', { code: 'NETWORK_ERROR', message: 'Could not reach /api/find-moments.', retryable: true }, 'Network error.');
-  });
+  const compactTranscript = params.transcript.map((t) => ({
+    start_seconds: Number(t.start_seconds.toFixed(2)),
+    end_seconds: Number(t.end_seconds.toFixed(2)),
+    text: t.text,
+  }));
 
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    throw toAppError('analyze', data, 'Failed to find matching clip moments.');
+  const dedupKey = `moments:${params.durationSeconds}:${params.clipCount ?? params.settings.clipCount}:${
+    params.settings.lengthRange
+  }:${params.settings.captionLanguage}:${params.customPrompt.trim()}:${compactTranscript.length}:${
+    compactTranscript[0]?.text?.slice(0, 24) || ''
+  }`;
+
+  return dedupInFlight(dedupKey, async () => {
+    const res = await fetch('/api/find-moments', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal,
+      body: JSON.stringify({
+        transcript: compactTranscript,
+        durationSeconds: params.durationSeconds,
+        customPrompt: params.customPrompt,
+        clipCount: params.clipCount ?? params.settings.clipCount,
+        lengthRange: params.settings.lengthRange,
+        captionLanguage: params.settings.captionLanguage,
+        allowOverlaps: Boolean(params.allowOverlaps),
+      }),
+    }).catch((err) => {
+      if (err?.name === 'AbortError') {
+        throw toAppError(
+          'analyze',
+          { code: 'CANCELLED', message: 'Moment search cancelled.', retryable: true },
+          'Cancelled.',
+        );
+      }
+      throw toAppError(
+        'analyze',
+        { code: 'NETWORK_ERROR', message: 'Could not reach /api/find-moments.', retryable: true },
+        'Network error.',
+      );
+    });
+
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw toAppError('analyze', data, 'Failed to find matching clip moments.');
+    }
+
+    const rawClips: RawClipResponse[] = Array.isArray(data.clips) ? data.clips : [];
+    return {
+      clips: mapRawClips(rawClips, params.settings.captionLanguage, params.settings.autoEdit),
+      usage: data.usage as ServerUsageStatus | undefined,
+    };
+  });
+}
+
+/**
+ * Score multiple clips in ONE batched text-only Gemini call to save tokens & quota.
+ */
+export async function scoreClipsBatchViaProxy(
+  clips: ClipItem[],
+  signal?: AbortSignal,
+): Promise<{
+  scores: Array<{
+    id: string;
+    virality_score: number;
+    virality_reason: string;
+    sub_scores: ViralitySubScores;
+  }>;
+  usage?: ServerUsageStatus;
+}> {
+  if (clips.length === 0) {
+    return { scores: [] };
   }
 
-  const rawClips: RawClipResponse[] = Array.isArray(data.clips) ? data.clips : [];
-  return {
-    clips: mapRawClips(rawClips, params.settings.captionLanguage, params.settings.autoEdit),
-    usage: data.usage as ServerUsageStatus | undefined,
-  };
+  const payloadClips = clips.slice(0, 12).map((clip) => ({
+    id: clip.id,
+    title: clip.title,
+    startSeconds: clip.start_seconds,
+    endSeconds: clip.end_seconds,
+    captionText: clip.caption_text,
+    hookReason: clip.hook_reason,
+    transcriptTexts: (clip.transcript || []).map((t) => t.text).slice(0, 20),
+  }));
+
+  const dedupKey = `score-batch:${payloadClips.map((c) => `${c.id}:${c.startSeconds}-${c.endSeconds}`).join(',')}`;
+
+  return dedupInFlight(dedupKey, async () => {
+    const res = await fetch('/api/clips/score-batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal,
+      body: JSON.stringify({ clips: payloadClips }),
+    });
+
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw toAppError('analyze', data, 'Could not score clips in batch.');
+    }
+
+    return {
+      scores: Array.isArray(data.scores) ? data.scores : [],
+      usage: data.usage as ServerUsageStatus | undefined,
+    };
+  });
+}
+
+/**
+ * Score a single clip on demand.
+ */
+export async function scoreClipViaProxy(
+  clip: ClipItem,
+  signal?: AbortSignal,
+): Promise<{
+  virality_score: number;
+  virality_reason: string;
+  sub_scores: ViralitySubScores;
+  usage?: ServerUsageStatus;
+}> {
+  const dedupKey = `score:${clip.id}:${clip.start_seconds}:${clip.end_seconds}:${clip.title}`;
+  return dedupInFlight(dedupKey, async () => {
+    const res = await fetch('/api/clips/score', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal,
+      body: JSON.stringify({
+        title: clip.title,
+        startSeconds: clip.start_seconds,
+        endSeconds: clip.end_seconds,
+        captionText: clip.caption_text,
+        hookReason: clip.hook_reason,
+        transcriptTexts: (clip.transcript || []).map((t) => t.text).slice(0, 30),
+      }),
+    });
+
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw toAppError('analyze', data, 'Could not score clip virality.');
+    }
+
+    return {
+      virality_score: Number(data.virality_score ?? 75),
+      virality_reason: String(data.virality_reason || ''),
+      sub_scores: data.sub_scores as ViralitySubScores,
+      usage: data.usage as ServerUsageStatus | undefined,
+    };
+  });
+}
+
+/**
+ * Translate existing clips' captions and phrase-level transcripts.
+ */
+export async function translateClipsCaptions(
+  clips: ClipItem[],
+  targetLanguage: CaptionLanguage,
+  signal?: AbortSignal,
+): Promise<{ clips: ClipItem[]; usage?: ServerUsageStatus }> {
+  const dedupKey = `translate:${targetLanguage}:${clips.map((c) => c.id).join(',')}`;
+  return dedupInFlight(dedupKey, async () => {
+    const res = await fetch('/api/clips/translate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal,
+      body: JSON.stringify({
+        targetLanguage,
+        clips: clips.map((c) => ({
+          id: c.id,
+          caption_text: c.caption_text,
+          transcript: (c.transcript || []).map((t) => ({
+            start_seconds: t.start_seconds,
+            end_seconds: t.end_seconds,
+            text: t.text,
+          })),
+        })),
+      }),
+    }).catch((err) => {
+      if (err?.name === 'AbortError') {
+        throw toAppError(
+          'analyze',
+          { code: 'CANCELLED', message: 'Translation cancelled.', retryable: true },
+          'Cancelled.',
+        );
+      }
+      throw toAppError(
+        'analyze',
+        { code: 'NETWORK_ERROR', message: 'Could not reach translation server.', retryable: true },
+        'Network error during caption translation.',
+      );
+    });
+
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw toAppError('analyze', data, 'Could not translate captions. Please retry.');
+    }
+
+    const translations = Array.isArray(data.translations)
+      ? (data.translations as Array<{ id: string; caption_text: string; transcript_texts: string[] }>)
+      : [];
+    const byId = new Map(translations.map((item) => [item.id, item]));
+
+    return {
+      clips: clips.map((clip) => {
+        const tr = byId.get(clip.id);
+        if (!tr) return clip;
+        return {
+          ...clip,
+          caption_text: tr.caption_text || clip.caption_text,
+          captionLanguage: targetLanguage,
+          transcript: (clip.transcript || []).map((seg, i) => ({
+            ...seg,
+            text: tr.transcript_texts?.[i] || seg.text,
+          })),
+        };
+      }),
+      usage: data.usage as ServerUsageStatus | undefined,
+    };
+  });
 }
 
 /**
@@ -703,99 +530,47 @@ export async function generateClipMetadataViaProxy(
   hashtags: string[];
   usage?: ServerUsageStatus;
 }> {
-  const res = await fetch('/api/generate-metadata', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    signal,
-    body: JSON.stringify({
-      title: params.clip.title,
-      hookReason: params.clip.hook_reason,
-      captionText: params.clip.caption_text,
-      transcriptTexts: (params.clip.transcript || []).map((t) => t.text).slice(0, 40),
-      targetLanguage: params.targetLanguage,
-      platform: params.platform || 'general',
-    }),
+  const dedupKey = `meta:${params.clip.id}:${params.targetLanguage}:${params.platform || 'general'}`;
+  return dedupInFlight(dedupKey, async () => {
+    const res = await fetch('/api/generate-metadata', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal,
+      body: JSON.stringify({
+        title: params.clip.title,
+        hookReason: params.clip.hook_reason,
+        captionText: params.clip.caption_text,
+        transcriptTexts: (params.clip.transcript || []).map((t) => t.text).slice(0, 30),
+        targetLanguage: params.targetLanguage,
+        platform: params.platform || 'general',
+      }),
+    });
+
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw toAppError('analyze', data, 'Could not generate clip metadata.');
+    }
+
+    return {
+      titles: Array.isArray(data.titles) ? (data.titles as string[]) : [],
+      description: String(data.description || ''),
+      hashtags: Array.isArray(data.hashtags) ? (data.hashtags as string[]) : [],
+      usage: data.usage as ServerUsageStatus | undefined,
+    };
   });
-
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    throw toAppError('analyze', data, 'Could not generate clip metadata.');
-  }
-
-  return {
-    titles: Array.isArray(data.titles) ? (data.titles as string[]) : [],
-    description: String(data.description || ''),
-    hashtags: Array.isArray(data.hashtags) ? (data.hashtags as string[]) : [],
-    usage: data.usage as ServerUsageStatus | undefined,
-  };
 }
 
 /**
- * Compute or refresh 0-100 virality score + hook/emotion/flow/shareability breakdown via /api/clips/score.
+ * Fetch current server-enforced AI usage quota status.
  */
-export async function scoreClipViaProxy(
-  clip: ClipItem,
-  signal?: AbortSignal,
-): Promise<{
-  virality_score: number;
-  virality_reason: string;
-  sub_scores: ViralitySubScores;
-  usage?: ServerUsageStatus;
-}> {
-  const res = await fetch('/api/clips/score', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    signal,
-    body: JSON.stringify({
-      title: clip.title,
-      startSeconds: clip.start_seconds,
-      endSeconds: clip.end_seconds,
-      captionText: clip.caption_text,
-      hookReason: clip.hook_reason,
-      transcriptTexts: (clip.transcript || []).map((t) => t.text).slice(0, 40),
-    }),
-  });
-
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    throw toAppError('analyze', data, 'Could not score clip virality.');
+export async function fetchServerUsage(): Promise<ServerUsageStatus | null> {
+  try {
+    const res = await fetch('/api/usage');
+    if (!res.ok) return null;
+    return (await res.json()) as ServerUsageStatus;
+  } catch {
+    return null;
   }
-
-  return {
-    virality_score: Number(data.virality_score ?? 75),
-    virality_reason: String(data.virality_reason || ''),
-    sub_scores: data.sub_scores as ViralitySubScores,
-    usage: data.usage as ServerUsageStatus | undefined,
-  };
-}
-
-/**
- * Submit an email with explicit consent to the Pro waitlist.
- */
-export async function joinProWaitlist(params: {
-  email: string;
-  consent: boolean;
-}): Promise<{ ok: boolean; alreadyJoined: boolean; message: string }> {
-  const res = await fetch('/api/waitlist', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      email: params.email,
-      consent: params.consent,
-      plan: 'pro',
-    }),
-  });
-
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    throw new Error(String(data.message || 'Could not join waitlist.'));
-  }
-
-  return {
-    ok: Boolean(data.ok),
-    alreadyJoined: Boolean(data.alreadyJoined),
-    message: String(data.message || 'Added to the waitlist.'),
-  };
 }
 
 /**
@@ -822,4 +597,3 @@ export async function submitUserFeedback(params: {
     message: String(data.message || 'Feedback received.'),
   };
 }
-

@@ -59,7 +59,7 @@
                 "name": "What file sizes and video formats are supported?",
                 "acceptedAnswer": {
                   "@type": "Answer",
-                  "text": "You can upload MP4 or MOV files up to 1 GB (1024 MB). Large files stream to our proxy in 8 MB slices and mount locally via WORKERFS. Best performance is on source videos up to 30 minutes."
+                  "text": "You can select local MP4 or MOV files up to 1 GB (1024 MB) via WORKERFS or paste a direct CORS-enabled MP4/MOV link without uploading the full video."
                 }
               },
               {
@@ -67,23 +67,23 @@
                 "name": "Where are my videos processed and stored?",
                 "acceptedAnswer": {
                   "@type": "Answer",
-                  "text": "Videos are cut, reframed, silence-trimmed, and captioned directly on your device using WebAssembly FFmpeg. Audio is sent securely through our server proxy for transcription and highlight analysis only when you start AI analysis."
+                  "text": "Videos are cut, reframed, silence-trimmed, and captioned directly on your device using WebAssembly FFmpeg. Only compact 16 kHz mono audio (capped at 45 minutes) is sent to Gemini for cloud transcription, or you can toggle optional on-device Whisper transcription."
                 }
               },
               {
                 "@type": "Question",
-                "name": "How do YouTube links and copyright work?",
+                "name": "How does transcript caching save tokens?",
                 "acceptedAnswer": {
                   "@type": "Answer",
-                  "text": "Public YouTube links are analyzed for timestamps and transcripts without ripping streams in your browser. Upload your own authorized source file to cut downloadable MP4 clips."
+                  "text": "Each video is transcribed once and cached in IndexedDB keyed by file hash. Highlight selection, batched virality scoring, titles, and translations run on text only."
                 }
               },
               {
                 "@type": "Question",
-                "name": "How do daily AI credits work?",
+                "name": "Can I sync my editing session across computers?",
                 "acceptedAnswer": {
                   "@type": "Answer",
-                  "text": "Each visitor receives 40 daily AI credits on our server. Manual cutting, waveform trimming, and local FFmpeg exports never consume AI credits."
+                  "text": "Yes. Sign in with Google to save and open lightweight .clipcutter.json project files via Google Drive File Picker."
                 }
               }
             ]

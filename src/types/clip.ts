@@ -1,16 +1,20 @@
 /**
  * Shared TypeScript types and upload limits for Clip Cutter.
- * Video processing runs locally in the browser; session & brand preferences persist in IndexedDB.
+ * Video processing runs locally in the browser; compressed audio only is sent for cloud transcription.
  */
 
-/** Maximum allowed upload file size: 1 GB (1024 MB) */
+/** Maximum allowed local video file size: 1 GB (1024 MB) */
 export const MAX_UPLOAD_MB = 1024;
 export const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024;
+
+/** Single-request cloud transcription limit (~45 minutes = 2700s) */
+export const MAX_CLOUD_TRANSCRIBE_SECONDS = 45 * 60;
 
 export type LengthRange = '15-30' | '30-60' | '60-90';
 export type AspectFormat = 'original' | 'vertical';
 export type InputMode = 'file' | 'link';
-export type ClipSourceMode = 'file' | 'youtube';
+export type ClipSourceMode = 'file' | 'direct-url';
+export type TranscriptionEngine = 'cloud' | 'whisper';
 export type CaptionLanguage = 'English' | 'Hindi' | 'Marathi' | 'Hinglish' | 'Spanish';
 export type BrandPosition = 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right';
 export type ThemeMode = 'dark' | 'light';
@@ -47,6 +51,29 @@ export interface TranscriptSegment {
   end_seconds: number;
   text: string;
   filler_words?: FillerWordSpan[];
+}
+
+export interface CachedTranscriptRecord {
+  fileHash: string;
+  fileName: string;
+  durationSeconds: number;
+  engine: TranscriptionEngine;
+  language: CaptionLanguage;
+  createdAt: number;
+  segments: TranscriptSegment[];
+}
+
+export interface ExtractedAudioResult {
+  blob: Blob;
+  mimeType: string;
+  fileName: string;
+  sizeBytes: number;
+}
+
+export interface LinkedDriveFile {
+  id: string;
+  name: string;
+  modifiedTime?: string;
 }
 
 export interface AutoEditSettings {
@@ -86,10 +113,14 @@ export interface VideoAsset {
   durationSeconds: number;
   width: number;
   height: number;
-  /** True when file size is large (> 500 MB up to 1 GB) and uses chunked streaming */
+  /** Fast fingerprint used for transcript cache & cross-device Drive matching */
+  fileHash?: string;
+  /** True when file size is large (> 500 MB up to 1 GB) and uses WORKERFS slice streaming */
   isLargeFile: boolean;
   /** Soft warning if duration exceeds 30 minutes (1800s) */
   isOverDurationLimit: boolean;
+  /** True if duration exceeds 45 minutes (cloud audio cap) */
+  isOverCloudTranscribeLimit: boolean;
 }
 
 export interface ClipSettings {
@@ -101,8 +132,10 @@ export interface ClipSettings {
   aspectFormat: AspectFormat;
   /** Optional user instruction guiding Gemini clip selection */
   customPrompt: string;
-  /** Language used by Gemini for transcript & caption translation + .SRT export */
+  /** Language used for transcript & caption translation + .SRT export */
   captionLanguage: CaptionLanguage;
+  /** Cloud audio proxy (default) vs optional in-browser Whisper transcription */
+  transcriptionEngine: TranscriptionEngine;
   /** Automatic post-cut editing toggles (all enabled by default) */
   autoEdit: AutoEditSettings;
 }
@@ -163,23 +196,17 @@ export interface ClipItem {
 export type AnalysisPhase =
   | 'idle'
   | 'fetching-url'
-  | 'uploading'
-  | 'processing'
+  | 'extracting-audio'
+  | 'transcribing'
   | 'analyzing'
   | 'ready'
   | 'error';
 
 export interface AppError {
-  stage: 'fetch' | 'upload' | 'processing' | 'analyze' | 'ffmpeg';
+  stage: 'fetch' | 'extract-audio' | 'transcribe' | 'analyze' | 'ffmpeg';
   code: string;
   message: string;
   retryable: boolean;
-}
-
-export interface GeminiFileSession {
-  name: string;
-  uri: string;
-  mimeType: string;
 }
 
 export interface RecentProjectSummary {

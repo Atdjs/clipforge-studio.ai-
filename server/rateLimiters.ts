@@ -28,42 +28,22 @@ function buildLimiter(options: {
 }
 
 /**
- * General API limiter across /api/* endpoints (excludes high-frequency 8 MB chunk uploads).
+ * General API limiter across /api/* endpoints.
  */
 export const generalApiLimiter = buildLimiter({
   windowMs: serverEnv.RATE_LIMIT_WINDOW_MS,
   limit: serverEnv.RATE_LIMIT_GENERAL_MAX,
   code: 'RATE_LIMIT',
   message: 'Too many requests from your connection. Please wait a moment and try again.',
-  skip: (req) => req.path === '/videos/upload/chunk' || req.path === '/health',
+  skip: (req) => req.path === '/health',
 });
 
 /**
- * Strict Gemini AI proxy limiter protecting /api/videos/analyze and /api/clips/translate.
+ * Strict Gemini AI proxy limiter protecting transcription, moment search, scoring, metadata, and translation routes.
  */
 export const geminiAiLimiter = buildLimiter({
   windowMs: serverEnv.RATE_LIMIT_WINDOW_MS,
   limit: serverEnv.RATE_LIMIT_AI_MAX,
   code: 'RATE_LIMIT',
   message: 'AI analysis rate limit reached. Please wait a minute before starting another analysis.',
-});
-
-/**
- * Upload session limiter for single uploads and chunked upload init/complete.
- */
-export const uploadSessionLimiter = buildLimiter({
-  windowMs: serverEnv.RATE_LIMIT_WINDOW_MS,
-  limit: serverEnv.RATE_LIMIT_UPLOAD_MAX,
-  code: 'RATE_LIMIT',
-  message: 'Too many video upload attempts in a short window. Please wait a moment and retry.',
-});
-
-/**
- * Chunk transfer limiter (sized generously so 1 GB = ~128 chunks of 8 MB passes smoothly).
- */
-export const uploadChunkLimiter = buildLimiter({
-  windowMs: serverEnv.RATE_LIMIT_WINDOW_MS,
-  limit: serverEnv.RATE_LIMIT_CHUNK_MAX,
-  code: 'RATE_LIMIT',
-  message: 'Upload chunk transfer rate limit reached. Please pause briefly and retry.',
 });

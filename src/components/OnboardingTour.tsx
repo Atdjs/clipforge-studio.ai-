@@ -9,15 +9,15 @@ interface OnboardingTourProps {
 const TOUR_STEPS = [
   {
     icon: Upload,
-    badge: 'Step 1 of 3 · Source',
-    title: 'Drop a 1 GB video or paste a link',
-    body: 'Local MP4/MOV files stream in 8 MB chunks to the secure server proxy for AI analysis, while cutting and reframing run locally in your browser via WORKERFS.',
+    badge: 'Step 1 of 3 · Audio Extraction',
+    title: 'Select a 1 GB video — zero full-video uploads',
+    body: 'Local MP4/MOV files stay on your device via WORKERFS. Browser FFmpeg extracts a compact 16 kHz mono audio track for cloud transcription (up to 45 min), or enable local Whisper to keep speech offline.',
   },
   {
     icon: BarChart3,
-    badge: 'Step 2 of 3 · Analysis',
-    title: 'Score hooks, find prompt moments & write metadata',
-    body: 'Every clip gets a 0–100 Virality Score with Hook, Emotion, Flow, and Shareability breakdown. Search custom moments like "funny" or "pricing", move the opening hook to the start, or burn a 2.2s hook card.',
+    badge: 'Step 2 of 3 · Cached Intelligence',
+    title: 'Cached transcripts, prompt search & batched scores',
+    body: 'Your transcript caches locally in IndexedDB keyed by file hash so repeat searches reuse zero transcription units. Batch-score clips, find prompt moments, and sync projects with Google Drive.',
   },
   {
     icon: Scissors,
@@ -101,9 +101,7 @@ export function OnboardingTour({ isOpen, onClose }: OnboardingTourProps) {
               onClick={() => setStepIdx(idx)}
               aria-label={`Go to step ${idx + 1}`}
               className={`h-1.5 rounded-full transition-all motion-reduce:transition-none ${
-                idx === stepIdx
-                  ? 'w-7 bg-[#E8A33D]'
-                  : 'w-2 bg-[#DFDCD2] dark:bg-[#2A2A2E]'
+                idx === stepIdx ? 'w-7 bg-[#E8A33D]' : 'w-2 bg-[#DFDCD2] dark:bg-[#2A2A2E]'
               }`}
             />
           ))}

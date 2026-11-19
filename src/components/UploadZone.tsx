@@ -2,15 +2,13 @@ import { useRef, useState, type DragEvent, type FormEvent } from 'react';
 import {
   AlertTriangle,
   Clock,
+  Cloud,
   FolderOpen,
   Globe,
   Link2,
-  Loader2,
-  Play,
   Trash2,
   Upload,
   X,
-  Youtube,
 } from 'lucide-react';
 import {
   MAX_UPLOAD_MB,
@@ -19,13 +17,12 @@ import {
   type VideoAsset,
 } from '../types/clip';
 import { formatBytes, formatTimecode } from '../utils/format';
-import { classifyVideoUrl } from '../utils/youtube';
+import { classifyDirectVideoUrl } from '../utils/videoUrl';
 
 export interface ActiveLinkTarget {
-  kind: 'youtube' | 'direct';
+  kind: 'direct';
   rawUrl: string;
   canonicalUrl: string;
-  youtubeVideoId?: string;
 }
 
 interface UploadZoneProps {
@@ -33,45 +30,39 @@ interface UploadZoneProps {
   onModeChange: (mode: InputMode) => void;
   video: VideoAsset | null;
   activeLink: ActiveLinkTarget | null;
-  pendingReuseCount: number;
   isBusy: boolean;
-  isLoadingSample?: boolean;
   selectionError: string | null;
   recentProjects: RecentProjectSummary[];
   onClearRecentProjects: () => void;
   onSelectFile: (file: File) => void;
-  onTrySampleVideo?: () => void;
+  onOpenFromDrive: () => void;
   onSubmitLink: (target: ActiveLinkTarget) => void;
   onClearLink: () => void;
   onClearSelectionError: () => void;
   onClearVideo: () => void;
-  onDismissPendingReuse: () => void;
 }
 
 /**
  * Step 1 Source Selector & Quiet Luxury Hero:
  * - Left-aligned serif headline + single honest supporting line
- * - Upload / Paste-link control + secondary "Try with a sample video" action
- * - Clean hairline 1 GB drop zone + Recent projects list
+ * - Upload MP4/MOV (up to 1 GB local WORKERFS) or paste direct MP4/MOV URL
+ * - Open saved project from Google Drive button
  */
 export function UploadZone({
   inputMode,
   onModeChange,
   video,
   activeLink,
-  pendingReuseCount,
   isBusy,
-  isLoadingSample = false,
   selectionError,
   recentProjects,
   onClearRecentProjects,
   onSelectFile,
-  onTrySampleVideo,
+  onOpenFromDrive,
   onSubmitLink,
   onClearLink,
   onClearSelectionError,
   onClearVideo,
-  onDismissPendingReuse,
 }: UploadZoneProps) {
   const inputRef = useRef<HTMLInputElement | null>(null);
   const [isDragging, setIsDragging] = useState(false);
@@ -106,27 +97,18 @@ export function UploadZone({
     e.preventDefault();
     if (isBusy) return;
 
-    const classified = classifyVideoUrl(urlDraft);
+    const classified = classifyDirectVideoUrl(urlDraft);
     if (classified.kind === 'invalid') {
       setLinkValidationError(classified.reason);
       return;
     }
 
     setLinkValidationError(null);
-    if (classified.kind === 'youtube') {
-      onSubmitLink({
-        kind: 'youtube',
-        rawUrl: urlDraft.trim(),
-        canonicalUrl: classified.canonicalUrl,
-        youtubeVideoId: classified.videoId,
-      });
-    } else {
-      onSubmitLink({
-        kind: 'direct',
-        rawUrl: urlDraft.trim(),
-        canonicalUrl: classified.url,
-      });
-    }
+    onSubmitLink({
+      kind: 'direct',
+      rawUrl: urlDraft.trim(),
+      canonicalUrl: classified.url,
+    });
   };
 
   return (
@@ -142,19 +124,18 @@ export function UploadZone({
         }}
       />
 
-      {/* Left-aligned Quiet Luxury Hero (before source is chosen) */}
       {!hasSelectedSource && (
         <div className="max-w-3xl space-y-3 pt-2">
           <h1 className="font-display text-3xl font-semibold tracking-tight text-[#151517] sm:text-5xl sm:leading-[1.08] [text-wrap:balance] dark:text-[#F2F0EA]">
             Cut long-form recordings into clean vertical shorts.
           </h1>
           <p className="max-w-2xl text-base leading-relaxed text-[#64625D] dark:text-[#8C8C93]">
-            Videos are cut on your device. Audio is sent securely for transcription only with your consent.
+            Videos stay on your device. Only compressed speech audio is extracted for transcription—or run Whisper locally in your browser.
           </p>
         </div>
       )}
 
-      {/* Mode Switcher + Secondary Sample Video Trigger */}
+      {/* Mode Switcher + Secondary Google Drive Picker Trigger */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div
           role="tablist"
@@ -170,64 +151,33 @@ export function UploadZone({
                 type="button"
                 role="tab"
                 aria-selected={isActive}
-                disabled={isBusy || isLoadingSample}
+                disabled={isBusy}
                 onClick={() => onModeChange(mode)}
-                className={`inline-flex min-h-[42px] items-center justify-center gap-2 rounded-md px-3 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#E8A33D] disabled:cursor-not-allowed disabled:opacity-50 whitespace-nowrap ${
+                className={`inline-flex min-h-[42px] items-center justify-center gap-2 whitespace-nowrap rounded-md px-3 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#E8A33D] disabled:cursor-not-allowed disabled:opacity-50 ${
                   isActive
-                    ? 'bg-[#E8A33D] text-[#0E0E0F] font-semibold'
+                    ? 'bg-[#E8A33D] font-semibold text-[#0E0E0F]'
                     : 'text-[#64625D] hover:text-[#151517] dark:text-[#8C8C93] dark:hover:text-[#F2F0EA]'
                 }`}
               >
                 <Icon className="h-4 w-4" aria-hidden="true" />
-                <span>{mode === 'file' ? 'Upload file' : 'Paste link'}</span>
+                <span>{mode === 'file' ? 'Upload file' : 'Paste direct URL'}</span>
               </button>
             );
           })}
         </div>
 
-        {!hasSelectedSource && onTrySampleVideo && (
+        {!hasSelectedSource && (
           <button
             type="button"
-            disabled={isBusy || isLoadingSample}
-            onClick={onTrySampleVideo}
-            className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-lg border border-[#DFDCD2] bg-white px-4 py-2 text-sm font-medium text-[#151517] transition-colors hover:border-[#E8A33D] disabled:opacity-50 dark:border-[#2A2A2E] dark:bg-[#151517] dark:text-[#F2F0EA] whitespace-nowrap"
+            disabled={isBusy}
+            onClick={onOpenFromDrive}
+            className="inline-flex min-h-[44px] items-center justify-center gap-2 whitespace-nowrap rounded-lg border border-[#DFDCD2] bg-white px-4 py-2 text-sm font-medium text-[#151517] transition-colors hover:border-[#E8A33D] disabled:opacity-50 dark:border-[#2A2A2E] dark:bg-[#151517] dark:text-[#F2F0EA]"
           >
-            {isLoadingSample ? (
-              <>
-                <Loader2 className="h-4 w-4 animate-spin text-[#E8A33D]" aria-hidden="true" />
-                <span>Loading sample...</span>
-              </>
-            ) : (
-              <>
-                <Play className="h-3.5 w-3.5 text-[#E8A33D]" aria-hidden="true" />
-                <span>Try with a sample video</span>
-              </>
-            )}
+            <Cloud className="h-4 w-4 text-[#E8A33D]" aria-hidden="true" />
+            <span>Open from Google Drive</span>
           </button>
         )}
       </div>
-
-      {/* Pending YouTube timestamps ready to auto-cut banner */}
-      {inputMode === 'file' && pendingReuseCount > 0 && !video && (
-        <div
-          role="status"
-          className="flex flex-col gap-3 rounded-xl border border-[#E8A33D]/50 bg-[#E8A33D]/10 p-4 text-sm text-[#151517] sm:flex-row sm:items-center sm:justify-between dark:text-[#F2F0EA]"
-        >
-          <p className="leading-relaxed">
-            <span className="font-semibold text-[#9A6516] dark:text-[#E8A33D]">
-              {pendingReuseCount} clip timestamps ready.
-            </span>{' '}
-            Upload the matching MP4 or MOV file below and Clip Cutter will cut them automatically.
-          </p>
-          <button
-            type="button"
-            onClick={onDismissPendingReuse}
-            className="min-h-[40px] shrink-0 rounded-lg border border-[#E8A33D]/50 px-3 py-1.5 text-xs font-medium text-[#9A6516] transition-colors hover:bg-[#E8A33D]/20 dark:text-[#E8A33D] whitespace-nowrap"
-          >
-            Discard timestamps
-          </button>
-        </div>
-      )}
 
       {selectionError && (
         <div
@@ -279,7 +229,7 @@ export function UploadZone({
               {isDragging ? 'Drop video to open in workspace' : 'Drop an MP4 or MOV file to begin'}
             </h2>
             <p className="mt-1.5 max-w-md text-sm leading-relaxed text-[#64625D] dark:text-[#8C8C93]">
-              Supports uploads up to 1 GB ({MAX_UPLOAD_MB} MB). Local trimming, 9:16 framing, and .SRT export execute on your device.
+              Reads locally up to 1 GB ({MAX_UPLOAD_MB} MB) via WORKERFS. Only small speech audio is extracted for AI transcription—never full video uploads.
             </p>
 
             <span className="mt-5 inline-flex min-h-[44px] items-center gap-2 rounded-lg bg-[#E8A33D] px-5 py-2.5 text-sm font-semibold text-[#0E0E0F] transition-colors group-hover:bg-[#DDA03A]">
@@ -288,7 +238,7 @@ export function UploadZone({
             </span>
 
             <p className="mt-4 font-mono text-xs tabular-nums text-[#64625D] dark:text-[#8C8C93]">
-              MP4 / MOV · Max 1 GB ({MAX_UPLOAD_MB} MB) · Chunked streaming enabled
+              MP4 / MOV · Max 1 GB ({MAX_UPLOAD_MB} MB) · Cloud audio cap 45 min
             </p>
           </div>
         ) : (
@@ -330,7 +280,7 @@ export function UploadZone({
                   type="button"
                   onClick={() => inputRef.current?.click()}
                   disabled={isBusy}
-                  className="min-h-[44px] rounded-lg border border-[#DFDCD2] bg-[#EFECE4] px-4 py-2 text-sm font-medium text-[#151517] transition-colors hover:border-[#E8A33D] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#E8A33D] disabled:cursor-not-allowed disabled:opacity-40 dark:border-[#2A2A2E] dark:bg-[#1C1C1F] dark:text-[#F2F0EA] whitespace-nowrap"
+                  className="min-h-[44px] whitespace-nowrap rounded-lg border border-[#DFDCD2] bg-[#EFECE4] px-4 py-2 text-sm font-medium text-[#151517] transition-colors hover:border-[#E8A33D] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#E8A33D] disabled:cursor-not-allowed disabled:opacity-40 dark:border-[#2A2A2E] dark:bg-[#1C1C1F] dark:text-[#F2F0EA]"
                 >
                   Replace
                 </button>
@@ -346,7 +296,7 @@ export function UploadZone({
               </div>
             </div>
 
-            {(video.isLargeFile || video.isOverDurationLimit) && (
+            {(video.isLargeFile || video.isOverCloudTranscribeLimit) && (
               <div
                 role="status"
                 className="mt-4 flex items-start gap-3 rounded-lg border border-[#E8A33D]/40 bg-[#E8A33D]/10 p-3.5 text-sm text-[#151517] dark:text-[#F2F0EA]"
@@ -354,14 +304,14 @@ export function UploadZone({
                 <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-[#E8A33D]" aria-hidden="true" />
                 <div className="space-y-0.5 leading-relaxed">
                   <p className="font-semibold text-[#9A6516] dark:text-[#E8A33D]">
-                    Large video streaming enabled
+                    {video.isOverCloudTranscribeLimit
+                      ? 'Video exceeds 45-minute cloud transcription cap'
+                      : 'Large file WORKERFS streaming active'}
                   </p>
                   <p className="text-xs text-[#64625D] dark:text-[#8C8C93]">
-                    {video.isLargeFile && video.isOverDurationLimit
-                      ? 'This video is large and over 30 minutes. It streams in 8 MB chunks for AI upload and mounts via WORKERFS slice reading locally.'
-                      : video.isLargeFile
-                        ? 'This large file (up to 1 GB / 1024 MB) uploads in 8 MB chunks and reads via WORKERFS.'
-                        : 'This video is longer than 30 minutes. Best performance is on clips up to 30 minutes; rendering speed depends on your device.'}
+                    {video.isOverCloudTranscribeLimit
+                      ? 'Cloud transcription accepts audio up to 45 minutes. Trim the video first, create manual clips below, or toggle "On-device Whisper" in settings.'
+                      : 'Reads via WORKERFS slices locally without full-video upload; audio extraction runs on-device before transcription.'}
                   </p>
                 </div>
               </div>
@@ -369,7 +319,7 @@ export function UploadZone({
           </div>
         )
       ) : (
-        /* Paste Link Tab */
+        /* Direct MP4 / MOV Link Tab */
         <div className="rounded-xl border border-[#DFDCD2] bg-white p-5 sm:p-6 dark:border-[#2A2A2E] dark:bg-[#151517]">
           <form onSubmit={handleLinkFormSubmit} className="space-y-4">
             <div>
@@ -377,10 +327,10 @@ export function UploadZone({
                 htmlFor="video-link-input"
                 className="block font-display text-base font-semibold text-[#151517] dark:text-[#F2F0EA]"
               >
-                Paste a public YouTube link or direct MP4 URL
+                Paste a direct MP4 or MOV video URL
               </label>
               <p className="mt-1 text-sm text-[#64625D] dark:text-[#8C8C93]">
-                Public YouTube links are analyzed for timestamps and transcripts; direct MP4 URLs download in-browser when allowed by CORS.
+                Fetches the video directly in your browser (host must permit CORS). Third-party streaming platform links are not supported.
               </p>
             </div>
 
@@ -389,7 +339,7 @@ export function UploadZone({
                 id="video-link-input"
                 type="url"
                 inputMode="url"
-                placeholder="https://www.youtube.com/watch?v=... or https://example.com/video.mp4"
+                placeholder="https://example.com/recording.mp4"
                 value={urlDraft}
                 disabled={isBusy}
                 onChange={(e) => {
@@ -401,10 +351,10 @@ export function UploadZone({
               <button
                 type="submit"
                 disabled={isBusy || !urlDraft.trim()}
-                className="inline-flex min-h-[46px] shrink-0 items-center justify-center gap-2 rounded-lg bg-[#E8A33D] px-5 py-2.5 text-sm font-semibold text-[#0E0E0F] transition-colors hover:bg-[#DDA03A] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#E8A33D] disabled:cursor-not-allowed disabled:opacity-40 whitespace-nowrap"
+                className="inline-flex min-h-[46px] shrink-0 items-center justify-center gap-2 whitespace-nowrap rounded-lg bg-[#E8A33D] px-5 py-2.5 text-sm font-semibold text-[#0E0E0F] transition-colors hover:bg-[#DDA03A] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#E8A33D] disabled:cursor-not-allowed disabled:opacity-40"
               >
                 <Link2 className="h-4 w-4" aria-hidden="true" />
-                <span>{activeLink ? 'Update link' : 'Load link'}</span>
+                <span>{activeLink ? 'Update URL' : 'Load URL'}</span>
               </button>
             </div>
 
@@ -419,17 +369,11 @@ export function UploadZone({
             <div className="mt-4 flex flex-col gap-3 border-t border-[#DFDCD2] pt-4 sm:flex-row sm:items-center sm:justify-between dark:border-[#2A2A2E]">
               <div className="flex min-w-0 items-center gap-3">
                 <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-[#DFDCD2] bg-[#EFECE4] text-[#E8A33D] dark:border-[#2A2A2E] dark:bg-[#1C1C1F]">
-                  {activeLink.kind === 'youtube' ? (
-                    <Youtube className="h-4 w-4" aria-hidden="true" />
-                  ) : (
-                    <Globe className="h-4 w-4" aria-hidden="true" />
-                  )}
+                  <Globe className="h-4 w-4" aria-hidden="true" />
                 </span>
                 <div className="min-w-0">
                   <p className="text-sm font-semibold text-[#151517] dark:text-[#F2F0EA]">
-                    {activeLink.kind === 'youtube'
-                      ? 'Public YouTube video ready for analysis'
-                      : 'Direct video URL ready to fetch & analyze'}
+                    Direct video URL ready to fetch &amp; extract audio
                   </p>
                   <p className="truncate font-mono text-xs text-[#64625D] dark:text-[#8C8C93]">
                     {activeLink.canonicalUrl}
@@ -455,7 +399,7 @@ export function UploadZone({
         </div>
       )}
 
-      {/* Recent projects list when idle and saved locally */}
+      {/* Recent projects list */}
       {!hasSelectedSource && recentProjects.length > 0 && (
         <div className="rounded-xl border border-[#DFDCD2] bg-white p-5 dark:border-[#2A2A2E] dark:bg-[#151517]">
           <div className="mb-3 flex items-center justify-between gap-3">

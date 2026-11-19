@@ -31,18 +31,15 @@ import type {
   BrandSettings,
   CaptionLanguage,
   ClipItem,
-  ClipSourceMode,
   TranscriptSegment,
 } from '../types/clip';
 import { formatTimecode } from '../utils/format';
-import { buildYouTubeEmbedUrl, buildYouTubeTimestampUrl } from '../utils/youtube';
 
 interface ClipCardProps {
   clip: ClipItem;
   index: number;
-  sourceMode: ClipSourceMode;
   sourceVideoUrl?: string;
-  youtubeVideoId?: string;
+  canCutLocally?: boolean;
   videoDuration?: number;
   timelineTotalDuration: number;
   aspectFormat: AspectFormat;
@@ -79,9 +76,8 @@ interface ClipCardProps {
 export function ClipCard({
   clip,
   index,
-  sourceMode,
   sourceVideoUrl,
-  youtubeVideoId,
+  canCutLocally = true,
   videoDuration,
   timelineTotalDuration,
   aspectFormat,
@@ -115,7 +111,6 @@ export function ClipCard({
   const [isMuted, setIsMuted] = useState(false);
   const [segmentProgress, setSegmentProgress] = useState(0);
   const [editedDuration, setEditedDuration] = useState<number | null>(null);
-  const [copiedLink, setCopiedLink] = useState(false);
   const [copiedSocial, setCopiedSocial] = useState(false);
 
   // Popover & collapsible panel state
@@ -137,8 +132,7 @@ export function ClipCard({
     setLengthDraft(String(Math.max(1, Math.round(clip.end_seconds - clip.start_seconds))));
   }, [clip.start_seconds, clip.end_seconds]);
 
-  const isYouTube = sourceMode === 'youtube' && Boolean(youtubeVideoId);
-  const isUsingCutOutput = !isYouTube && Boolean(clip.outputUrl && clip.cutStatus === 'done');
+  const isUsingCutOutput = Boolean(clip.outputUrl && clip.cutStatus === 'done');
   const previewSrc = isUsingCutOutput ? clip.outputUrl! : sourceVideoUrl || '';
   const clipDuration = Math.max(1, clip.end_seconds - clip.start_seconds);
   const segStart = isUsingCutOutput ? 0 : clip.start_seconds;
@@ -175,7 +169,6 @@ export function ClipCard({
   }, [clip.transcript, clip.start_seconds, clip.end_seconds]);
 
   useEffect(() => {
-    if (isYouTube) return;
     const vid = videoRef.current;
     if (!vid) return;
     setIsPlaying(false);
@@ -187,7 +180,7 @@ export function ClipCard({
       vid.pause();
       vid.currentTime = segStart;
     }
-  }, [segStart, previewSrc, isYouTube, isUsingCutOutput]);
+  }, [segStart, previewSrc, isUsingCutOutput]);
 
   const handleLoadedMetadata = () => {
     const vid = videoRef.current;
@@ -241,7 +234,7 @@ export function ClipCard({
   togglePlayRef.current = togglePlay;
 
   useEffect(() => {
-    if (isYouTube) {
+    if (!previewSrc) {
       registerPlayToggle(clip.id, null);
       return;
     }
@@ -249,7 +242,7 @@ export function ClipCard({
       void togglePlayRef.current();
     });
     return () => registerPlayToggle(clip.id, null);
-  }, [clip.id, isYouTube, registerPlayToggle]);
+  }, [clip.id, previewSrc, registerPlayToggle]);
 
   const toggleMute = () => {
     const vid = videoRef.current;
@@ -338,17 +331,8 @@ export function ClipCard({
     }
   };
 
-  const handleCopyTimestampLink = async () => {
-    if (!youtubeVideoId) return;
-    const shareUrl = buildYouTubeTimestampUrl(youtubeVideoId, clip.start_seconds);
-    await handleCopyText(shareUrl, () => {
-      setCopiedLink(true);
-      setTimeout(() => setCopiedLink(false), 2000);
-    });
-  };
-
   const isBusyThisClip = clip.cutStatus === 'cutting' || clip.cutStatus === 'queued';
-  const isReady = !isYouTube && clip.cutStatus === 'done' && Boolean(clip.outputBlob);
+  const isReady = clip.cutStatus === 'done' && Boolean(clip.outputBlob);
   const transcriptList = clip.transcript || [];
   const showVerticalGuide = currentAutoEdit.reframeVertical || aspectFormat === 'vertical';
 
@@ -448,15 +432,7 @@ export function ClipCard({
     >
       {/* Video Preview Frame */}
       <div className="relative aspect-video w-full overflow-hidden bg-[#0E0E0F]">
-        {isYouTube && youtubeVideoId ? (
-          <iframe
-            src={buildYouTubeEmbedUrl(youtubeVideoId, clip.start_seconds, clip.end_seconds)}
-            title={clip.title}
-            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
-            allowFullScreen
-            className="h-full w-full border-0"
-          />
-        ) : (
+        {previewSrc ? (
           <>
             <video
               ref={videoRef}
@@ -563,6 +539,23 @@ export function ClipCard({
               </button>
             </div>
           </>
+        ) : (
+          <div className="flex h-full flex-col items-center justify-center p-4 text-center">
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                setIsWhyOpen((prev) => !prev);
+              }}
+              className={`mb-2 inline-flex min-h-[30px] items-center gap-1.5 rounded-md border px-2.5 py-0.5 font-mono text-xs font-medium tabular-nums ${scoreTone}`}
+            >
+              <BarChart3 className="h-3 w-3" aria-hidden="true" />
+              <span>{score}/100 · {scoreTier}</span>
+            </button>
+            <p className="text-xs text-[#8C8C93]">
+              Re-attach your matching video file above to preview and cut this Drive clip.
+            </p>
+          </div>
         )}
       </div>
 
@@ -579,7 +572,7 @@ export function ClipCard({
               width: `${segmentWidthPct}%`,
             }}
           />
-          {!isYouTube && isPlaying && (
+          {isPlaying && (
             <div
               className="absolute inset-y-0 w-0.5 bg-[#151517] dark:bg-[#F2F0EA]"
               style={{
@@ -610,25 +603,10 @@ export function ClipCard({
               <span>{Math.round(clipDuration)}s</span>
               <span aria-hidden="true">·</span>
               <span>
-                {isYouTube
-                  ? 'YouTube'
-                  : (isReady ? clip.autoEditApplied?.reframeVertical : showVerticalGuide)
-                    ? '9:16'
-                    : 'Original'}
+                {(isReady ? clip.autoEditApplied?.reframeVertical : showVerticalGuide)
+                  ? '9:16'
+                  : 'Original'}
               </span>
-              {isYouTube && (
-                <button
-                  type="button"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setIsWhyOpen((p) => !p);
-                  }}
-                  className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[11px] font-medium ${scoreInlineTone}`}
-                >
-                  <BarChart3 className="h-3 w-3" aria-hidden="true" />
-                  <span>{score}</span>
-                </button>
-              )}
               {isFocused && (
                 <span className="rounded border border-[#E8A33D]/50 bg-[#E8A33D]/10 px-1.5 py-0.5 font-sans text-[11px] font-medium text-[#151517] dark:text-[#E8A33D]">
                   Focused
@@ -792,43 +770,41 @@ export function ClipCard({
               </p>
             )}
 
-            {!isYouTube && (
-              <div className="flex flex-wrap items-center gap-2 pt-1">
-                {canMoveHookToStart && !clip.hookMovedToStart && (
-                  <button
-                    type="button"
-                    disabled={isBusyThisClip}
-                    onClick={() => onMoveHookToStart(clip.id)}
-                    className="inline-flex min-h-[36px] items-center gap-1.5 rounded-md border border-[#E8A33D]/50 bg-[#E8A33D]/10 px-2.5 text-[11px] font-medium text-[#151517] transition-colors hover:bg-[#E8A33D] hover:text-[#0E0E0F] disabled:opacity-45 dark:text-[#E8A33D] dark:hover:text-[#0E0E0F]"
-                  >
-                    <ArrowUpToLine className="h-3.5 w-3.5" aria-hidden="true" />
-                    <span>Move hook to start</span>
-                  </button>
-                )}
-
-                {clip.hookMovedToStart && (
-                  <span className="inline-flex items-center gap-1 text-[11px] font-medium text-emerald-700 dark:text-emerald-400">
-                    <Check className="h-3.5 w-3.5" aria-hidden="true" />
-                    <span>Starts on hook</span>
-                  </span>
-                )}
-
+            <div className="flex flex-wrap items-center gap-2 pt-1">
+              {canMoveHookToStart && !clip.hookMovedToStart && (
                 <button
                   type="button"
-                  role="switch"
-                  aria-checked={Boolean(clip.addHookTitleCard)}
                   disabled={isBusyThisClip}
-                  onClick={() => onToggleHookTitleCard(clip.id, !clip.addHookTitleCard)}
-                  className={`inline-flex min-h-[36px] items-center gap-1.5 rounded-md border px-2.5 text-[11px] font-medium transition-colors disabled:opacity-45 ${
-                    clip.addHookTitleCard
-                      ? 'border-[#E8A33D] bg-[#E8A33D]/15 text-[#151517] dark:text-[#E8A33D]'
-                      : 'border-[#DFDCD2] bg-white text-[#64625D] hover:text-[#151517] dark:border-[#2A2A2E] dark:bg-[#151517] dark:text-[#8C8C93] dark:hover:text-[#F2F0EA]'
-                  }`}
+                  onClick={() => onMoveHookToStart(clip.id)}
+                  className="inline-flex min-h-[36px] items-center gap-1.5 rounded-md border border-[#E8A33D]/50 bg-[#E8A33D]/10 px-2.5 text-[11px] font-medium text-[#151517] transition-colors hover:bg-[#E8A33D] hover:text-[#0E0E0F] disabled:opacity-45 dark:text-[#E8A33D] dark:hover:text-[#0E0E0F]"
                 >
-                  <span>Hook card {clip.addHookTitleCard ? 'ON' : 'OFF'}</span>
+                  <ArrowUpToLine className="h-3.5 w-3.5" aria-hidden="true" />
+                  <span>Move hook to start</span>
                 </button>
-              </div>
-            )}
+              )}
+
+              {clip.hookMovedToStart && (
+                <span className="inline-flex items-center gap-1 text-[11px] font-medium text-emerald-700 dark:text-emerald-400">
+                  <Check className="h-3.5 w-3.5" aria-hidden="true" />
+                  <span>Starts on hook</span>
+                </span>
+              )}
+
+              <button
+                type="button"
+                role="switch"
+                aria-checked={Boolean(clip.addHookTitleCard)}
+                disabled={isBusyThisClip}
+                onClick={() => onToggleHookTitleCard(clip.id, !clip.addHookTitleCard)}
+                className={`inline-flex min-h-[36px] items-center gap-1.5 rounded-md border px-2.5 text-[11px] font-medium transition-colors disabled:opacity-45 ${
+                  clip.addHookTitleCard
+                    ? 'border-[#E8A33D] bg-[#E8A33D]/15 text-[#151517] dark:text-[#E8A33D]'
+                    : 'border-[#DFDCD2] bg-white text-[#64625D] hover:text-[#151517] dark:border-[#2A2A2E] dark:bg-[#151517] dark:text-[#8C8C93] dark:hover:text-[#F2F0EA]'
+                }`}
+              >
+                <span>Hook card {clip.addHookTitleCard ? 'ON' : 'OFF'}</span>
+              </button>
+            </div>
           </div>
         )}
 
@@ -1185,57 +1161,55 @@ export function ClipCard({
           </div>
         </div>
 
-        {/* Silence & Filler Word Removal Toggle (File Mode) */}
-        {!isYouTube && (
-          <div className="mt-4 space-y-1.5 border-t border-[#DFDCD2] pt-3 dark:border-[#2A2A2E]">
-            <button
-              type="button"
-              role="switch"
-              aria-checked={Boolean(clip.removeSilencesAndFillers)}
-              disabled={isBusyThisClip}
-              onClick={() =>
-                onToggleRemoveSilences(clip.id, !Boolean(clip.removeSilencesAndFillers))
-              }
-              className="flex min-h-[44px] w-full items-center justify-between gap-3 rounded-lg px-1 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#E8A33D] disabled:opacity-50"
-            >
-              <div className="min-w-0">
-                <span className="block text-xs font-medium text-[#151517] dark:text-[#F2F0EA]">
-                  Remove silences and filler words
-                </span>
-                <span className="block font-mono text-[11px] tabular-nums text-[#64625D] dark:text-[#8C8C93]">
-                  {detectedFillerCount > 0
-                    ? `${detectedFillerCount} filler${detectedFillerCount === 1 ? '' : 's'} detected · + silence detect`
-                    : 'FFmpeg silencedetect + AI filler spans'}
-                </span>
-              </div>
-              <span
-                aria-hidden="true"
-                className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors ${
-                  clip.removeSilencesAndFillers
-                    ? 'bg-[#E8A33D]'
-                    : 'bg-[#DFDCD2] dark:bg-[#2A2A2E]'
-                }`}
-              >
-                <span
-                  className={`inline-block h-4 w-4 rounded-full bg-white transition-transform ${
-                    clip.removeSilencesAndFillers ? 'translate-x-6' : 'translate-x-1'
-                  }`}
-                />
+        {/* Silence & Filler Word Removal Toggle */}
+        <div className="mt-4 space-y-1.5 border-t border-[#DFDCD2] pt-3 dark:border-[#2A2A2E]">
+          <button
+            type="button"
+            role="switch"
+            aria-checked={Boolean(clip.removeSilencesAndFillers)}
+            disabled={isBusyThisClip}
+            onClick={() =>
+              onToggleRemoveSilences(clip.id, !Boolean(clip.removeSilencesAndFillers))
+            }
+            className="flex min-h-[44px] w-full items-center justify-between gap-3 rounded-lg px-1 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#E8A33D] disabled:opacity-50"
+          >
+            <div className="min-w-0">
+              <span className="block text-xs font-medium text-[#151517] dark:text-[#F2F0EA]">
+                Remove silences and filler words
               </span>
-            </button>
+              <span className="block font-mono text-[11px] tabular-nums text-[#64625D] dark:text-[#8C8C93]">
+                {detectedFillerCount > 0
+                  ? `${detectedFillerCount} filler${detectedFillerCount === 1 ? '' : 's'} detected · + silence detect`
+                  : 'FFmpeg silencedetect + AI filler spans'}
+              </span>
+            </div>
+            <span
+              aria-hidden="true"
+              className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors ${
+                clip.removeSilencesAndFillers
+                  ? 'bg-[#E8A33D]'
+                  : 'bg-[#DFDCD2] dark:bg-[#2A2A2E]'
+              }`}
+            >
+              <span
+                className={`inline-block h-4 w-4 rounded-full bg-white transition-transform ${
+                  clip.removeSilencesAndFillers ? 'translate-x-6' : 'translate-x-1'
+                }`}
+              />
+            </span>
+          </button>
 
-            {isReady && clip.removeSilencesAndFillers && typeof clip.removedSeconds === 'number' && (
-              <p className="flex items-center gap-1.5 px-1 font-mono text-xs tabular-nums text-emerald-700 dark:text-emerald-400">
-                <CheckCircle2 className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-                <span>
-                  {clip.removedSeconds > 0
-                    ? `Removed ${clip.removedSeconds.toFixed(1)}s of silences & fillers`
-                    : 'No silences or fillers >0.45s found'}
-                </span>
-              </p>
-            )}
-          </div>
-        )}
+          {isReady && clip.removeSilencesAndFillers && typeof clip.removedSeconds === 'number' && (
+            <p className="flex items-center gap-1.5 px-1 font-mono text-xs tabular-nums text-emerald-700 dark:text-emerald-400">
+              <CheckCircle2 className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+              <span>
+                {clip.removedSeconds > 0
+                  ? `Removed ${clip.removedSeconds.toFixed(1)}s of silences & fillers`
+                  : 'No silences or fillers >0.45s found'}
+              </span>
+            </p>
+          )}
+        </div>
 
         {hasOverlap && (
           <div className="mt-3 flex items-center gap-2 text-xs font-medium text-[#E8A33D]">
@@ -1245,7 +1219,7 @@ export function ClipCard({
         )}
 
         {/* Cutting Progress Bar */}
-        {!isYouTube && clip.cutStatus !== 'idle' && (
+        {clip.cutStatus !== 'idle' && (
           <div className="mt-4 space-y-1.5 border-t border-[#DFDCD2] pt-3 dark:border-[#2A2A2E]">
             <div className="flex items-center justify-between text-xs">
               {clip.cutStatus === 'queued' && (
@@ -1301,42 +1275,12 @@ export function ClipCard({
 
         {/* Action Footer */}
         <div className="mt-auto flex flex-wrap items-center gap-2 pt-4">
-          {isYouTube ? (
-            <>
-              <button
-                type="button"
-                onClick={() => void handleCopyTimestampLink()}
-                className="inline-flex min-h-[44px] flex-1 items-center justify-center gap-2 rounded-lg bg-[#E8A33D] px-4 py-2 text-sm font-semibold text-[#0E0E0F] transition-colors hover:bg-[#DDA03A] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#E8A33D] whitespace-nowrap"
-              >
-                {copiedLink ? (
-                  <>
-                    <Check className="h-4 w-4" aria-hidden="true" />
-                    <span>Copied link</span>
-                  </>
-                ) : (
-                  <>
-                    <Copy className="h-4 w-4" aria-hidden="true" />
-                    <span>Copy link</span>
-                  </>
-                )}
-              </button>
-
-              <button
-                type="button"
-                onClick={() => onDownloadSrt(clip, index)}
-                title={`Download ${clip.captionLanguage || 'English'} .SRT captions`}
-                className="inline-flex min-h-[44px] items-center justify-center gap-1.5 rounded-lg border border-[#DFDCD2] bg-[#EFECE4] px-3.5 py-2 text-xs font-medium text-[#151517] transition-colors hover:border-[#64625D] dark:border-[#2A2A2E] dark:bg-[#1C1C1F] dark:text-[#F2F0EA] dark:hover:border-[#8C8C93] whitespace-nowrap"
-              >
-                <Captions className="h-4 w-4 text-[#E8A33D]" aria-hidden="true" />
-                <span>.SRT</span>
-              </button>
-            </>
-          ) : isReady ? (
+          {isReady ? (
             <>
               <button
                 type="button"
                 onClick={() => onSaveToDevice(clip, index)}
-                className="inline-flex min-h-[44px] flex-1 items-center justify-center gap-2 rounded-lg bg-[#E8A33D] px-3.5 py-2 text-sm font-semibold text-[#0E0E0F] transition-colors hover:bg-[#DDA03A] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#E8A33D] whitespace-nowrap"
+                className="inline-flex min-h-[44px] flex-1 items-center justify-center gap-2 whitespace-nowrap rounded-lg bg-[#E8A33D] px-3.5 py-2 text-sm font-semibold text-[#0E0E0F] transition-colors hover:bg-[#DDA03A] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#E8A33D]"
               >
                 <Download className="h-4 w-4" aria-hidden="true" />
                 <span>Download</span>
@@ -1344,9 +1288,9 @@ export function ClipCard({
 
               <button
                 type="button"
-                disabled={isCuttingAny}
+                disabled={!canCutLocally || isCuttingAny}
                 onClick={() => onReEditClip(clip.id)}
-                className="inline-flex min-h-[44px] items-center justify-center gap-1.5 rounded-lg border border-[#E8A33D]/50 bg-[#E8A33D]/10 px-3.5 py-2 text-sm font-medium text-[#151517] transition-colors hover:bg-[#E8A33D] hover:text-[#0E0E0F] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#E8A33D] disabled:cursor-not-allowed disabled:opacity-45 dark:text-[#E8A33D] dark:hover:text-[#0E0E0F] whitespace-nowrap"
+                className="inline-flex min-h-[44px] items-center justify-center gap-1.5 whitespace-nowrap rounded-lg border border-[#E8A33D]/50 bg-[#E8A33D]/10 px-3.5 py-2 text-sm font-medium text-[#151517] transition-colors hover:bg-[#E8A33D] hover:text-[#0E0E0F] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#E8A33D] disabled:cursor-not-allowed disabled:opacity-45 dark:text-[#E8A33D] dark:hover:text-[#0E0E0F]"
               >
                 <RefreshCw className="h-4 w-4" aria-hidden="true" />
                 <span>Re-edit</span>
@@ -1355,7 +1299,7 @@ export function ClipCard({
               <button
                 type="button"
                 onClick={() => void onShareClip(clip, index)}
-                className="inline-flex min-h-[44px] items-center justify-center gap-1.5 rounded-lg border border-[#DFDCD2] bg-[#EFECE4] px-3 py-2 text-xs font-medium text-[#151517] transition-colors hover:border-[#64625D] dark:border-[#2A2A2E] dark:bg-[#1C1C1F] dark:text-[#F2F0EA] dark:hover:border-[#8C8C93] whitespace-nowrap"
+                className="inline-flex min-h-[44px] items-center justify-center gap-1.5 whitespace-nowrap rounded-lg border border-[#DFDCD2] bg-[#EFECE4] px-3 py-2 text-xs font-medium text-[#151517] transition-colors hover:border-[#64625D] dark:border-[#2A2A2E] dark:bg-[#1C1C1F] dark:text-[#F2F0EA] dark:hover:border-[#8C8C93]"
               >
                 <Share2 className="h-4 w-4 text-[#E8A33D]" aria-hidden="true" />
                 <span>Share</span>
@@ -1365,7 +1309,7 @@ export function ClipCard({
                 type="button"
                 onClick={() => onDownloadSrt(clip, index)}
                 title={`Download ${clip.captionLanguage || 'English'} .SRT captions`}
-                className="inline-flex min-h-[44px] items-center justify-center gap-1.5 rounded-lg border border-[#DFDCD2] bg-[#EFECE4] px-3 py-2 text-xs font-medium text-[#151517] transition-colors hover:border-[#64625D] dark:border-[#2A2A2E] dark:bg-[#1C1C1F] dark:text-[#F2F0EA] dark:hover:border-[#8C8C93] whitespace-nowrap"
+                className="inline-flex min-h-[44px] items-center justify-center gap-1.5 whitespace-nowrap rounded-lg border border-[#DFDCD2] bg-[#EFECE4] px-3 py-2 text-xs font-medium text-[#151517] transition-colors hover:border-[#64625D] dark:border-[#2A2A2E] dark:bg-[#1C1C1F] dark:text-[#F2F0EA] dark:hover:border-[#8C8C93]"
               >
                 <Captions className="h-4 w-4 text-[#E8A33D]" aria-hidden="true" />
                 <span>.SRT</span>
@@ -1376,8 +1320,8 @@ export function ClipCard({
               <button
                 type="button"
                 onClick={() => onCutClip(clip.id)}
-                disabled={isCuttingAny}
-                className="inline-flex min-h-[44px] flex-1 items-center justify-center gap-2 rounded-lg bg-[#E8A33D] px-4 py-2 text-sm font-semibold text-[#0E0E0F] transition-colors hover:bg-[#DDA03A] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#E8A33D] disabled:cursor-not-allowed disabled:opacity-45 whitespace-nowrap"
+                disabled={!canCutLocally || isCuttingAny}
+                className="inline-flex min-h-[44px] flex-1 items-center justify-center gap-2 whitespace-nowrap rounded-lg bg-[#E8A33D] px-4 py-2 text-sm font-semibold text-[#0E0E0F] transition-colors hover:bg-[#DDA03A] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#E8A33D] disabled:cursor-not-allowed disabled:opacity-45"
               >
                 {clip.cutStatus === 'error' ? (
                   <>
@@ -1392,7 +1336,7 @@ export function ClipCard({
                 ) : (
                   <>
                     <Scissors className="h-4 w-4" aria-hidden="true" />
-                    <span>Cut &amp; Edit</span>
+                    <span>{canCutLocally ? 'Cut & Edit' : 'Attach video to cut'}</span>
                   </>
                 )}
               </button>
@@ -1401,7 +1345,7 @@ export function ClipCard({
                 type="button"
                 onClick={() => onDownloadSrt(clip, index)}
                 title={`Download ${clip.captionLanguage || 'English'} .SRT captions`}
-                className="inline-flex min-h-[44px] items-center justify-center gap-1.5 rounded-lg border border-[#DFDCD2] bg-[#EFECE4] px-3.5 py-2 text-xs font-medium text-[#151517] transition-colors hover:border-[#64625D] dark:border-[#2A2A2E] dark:bg-[#1C1C1F] dark:text-[#F2F0EA] dark:hover:border-[#8C8C93] whitespace-nowrap"
+                className="inline-flex min-h-[44px] items-center justify-center gap-1.5 whitespace-nowrap rounded-lg border border-[#DFDCD2] bg-[#EFECE4] px-3.5 py-2 text-xs font-medium text-[#151517] transition-colors hover:border-[#64625D] dark:border-[#2A2A2E] dark:bg-[#1C1C1F] dark:text-[#F2F0EA] dark:hover:border-[#8C8C93]"
               >
                 <Captions className="h-4 w-4 text-[#E8A33D]" aria-hidden="true" />
                 <span>.SRT</span>

@@ -1,9 +1,15 @@
-import type { AutoEditSettings, BrandSettings, ClipItem } from '../types/clip';
+import type {
+  AutoEditSettings,
+  BrandSettings,
+  ClipItem,
+  ExtractedAudioResult,
+} from '../types/clip';
 import { renderCaptionOverlayPngs, renderHookTitleCardPng } from '../utils/captionRenderer';
 
 type WorkerResponse =
   | { type: 'progress'; id: string; progress: number; stage?: string }
   | { type: 'done'; id: string; buffer: ArrayBuffer; removedSeconds?: number }
+  | { type: 'audio-done'; id: string; buffer: ArrayBuffer; mimeType: string; fileName: string }
   | { type: 'error'; id: string; error: string };
 
 export interface CutClipResult {
@@ -11,19 +17,27 @@ export interface CutClipResult {
   removedSeconds: number;
 }
 
-interface PendingCutJob {
-  resolve: (result: CutClipResult) => void;
-  reject: (err: Error) => void;
-  onProgress: (percent: number, stage?: string) => void;
-}
+type PendingJob =
+  | {
+      kind: 'cut';
+      resolve: (result: CutClipResult) => void;
+      reject: (err: Error) => void;
+      onProgress: (percent: number, stage?: string) => void;
+    }
+  | {
+      kind: 'audio';
+      resolve: (result: ExtractedAudioResult) => void;
+      reject: (err: Error) => void;
+      onProgress: (percent: number, stage?: string) => void;
+    };
 
 /**
  * Main-thread bridge to our dedicated ffmpeg.wasm Web Worker.
- * Pre-renders caption PNG overlays via browser Canvas when burnCaptions is ON,
- * and transfers all buffers zero-copy to keep the UI responsive.
+ * Streams video via WORKERFS to either extract compact 16kHz mono speech audio
+ * or cut & auto-edit clips with burned caption PNG overlays.
  */
 let workerInstance: Worker | null = null;
-const pendingJobs = new Map<string, PendingCutJob>();
+const pendingJobs = new Map<string, PendingJob>();
 
 function getWorker(): Worker {
   if (workerInstance) return workerInstance;
@@ -42,7 +56,7 @@ function getWorker(): Worker {
       return;
     }
 
-    if (msg.type === 'done') {
+    if (msg.type === 'done' && job.kind === 'cut') {
       pendingJobs.delete(msg.id);
       job.onProgress(100);
       job.resolve({
@@ -52,9 +66,22 @@ function getWorker(): Worker {
       return;
     }
 
+    if (msg.type === 'audio-done' && job.kind === 'audio') {
+      pendingJobs.delete(msg.id);
+      job.onProgress(100);
+      const blob = new Blob([msg.buffer], { type: msg.mimeType || 'audio/ogg' });
+      job.resolve({
+        blob,
+        mimeType: msg.mimeType || 'audio/ogg',
+        fileName: msg.fileName || 'speech-audio.ogg',
+        sizeBytes: blob.size,
+      });
+      return;
+    }
+
     if (msg.type === 'error') {
       pendingJobs.delete(msg.id);
-      job.reject(new Error(msg.error || 'FFmpeg worker cutting failed.'));
+      job.reject(new Error(msg.error || 'FFmpeg worker failed.'));
     }
   };
 
@@ -71,6 +98,27 @@ function getWorker(): Worker {
   };
 
   return workerInstance;
+}
+
+/**
+ * Extract a small 16 kHz mono 32 kbps speech track (Opus/MP3/AAC) on-device using WORKERFS.
+ * Reused both for cloud/Whisper transcription and for the Waveform timeline.
+ */
+export async function extractCompactAudioInBrowser(
+  sourceFile: File,
+  onProgress: (percent: number, stage?: string) => void,
+): Promise<ExtractedAudioResult> {
+  const jobId = `audio-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+
+  return new Promise<ExtractedAudioResult>((resolve, reject) => {
+    const worker = getWorker();
+    pendingJobs.set(jobId, { kind: 'audio', resolve, reject, onProgress });
+    worker.postMessage({
+      type: 'extract-audio',
+      id: jobId,
+      file: sourceFile,
+    });
+  });
 }
 
 /**
@@ -103,7 +151,6 @@ export async function cutClipInBrowser(params: {
 }): Promise<CutClipResult> {
   const { sourceFile, sourceWidth, clip, autoEdit, brandSettings, onProgress } = params;
 
-  // Respect per-clip silence toggle when explicitly changed, otherwise global autoEdit.removeSilences
   const shouldRemoveSilences =
     typeof clip.removeSilencesAndFillers === 'boolean'
       ? clip.removeSilencesAndFillers
@@ -120,7 +167,6 @@ export async function cutClipInBrowser(params: {
 
   const fillerSpans = effectiveAutoEdit.removeSilences ? extractFillerSpansForClip(clip) : [];
 
-  // Render crisp PNG caption overlays on main thread before posting to worker
   const captionOverlays = effectiveAutoEdit.burnCaptions
     ? await renderCaptionOverlayPngs(clip, targetOutWidth, effectiveAutoEdit.captionStyle)
     : [];
@@ -157,7 +203,7 @@ export async function cutClipInBrowser(params: {
 
   return new Promise<CutClipResult>((resolve, reject) => {
     const worker = getWorker();
-    pendingJobs.set(clip.id, { resolve, reject, onProgress });
+    pendingJobs.set(clip.id, { kind: 'cut', resolve, reject, onProgress });
     const transferables: Transferable[] = [];
     if (brandOverlay?.logoBytes) {
       transferables.push(brandOverlay.logoBytes);

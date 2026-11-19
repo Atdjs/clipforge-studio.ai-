@@ -1,5 +1,5 @@
-import { HelpCircle, Keyboard, Moon, Scissors, Sun, Upload } from 'lucide-react';
-import type { ServerUsageStatus, ThemeMode } from '../types/clip';
+import { Check, Cloud, HelpCircle, Keyboard, Moon, Scissors, Sun, Upload } from 'lucide-react';
+import type { LinkedDriveFile, ServerUsageStatus, ThemeMode } from '../types/clip';
 
 interface HeaderProps {
   hasVideo: boolean;
@@ -7,6 +7,8 @@ interface HeaderProps {
   isLegalOpen: boolean;
   theme: ThemeMode;
   usage: ServerUsageStatus | null;
+  linkedDriveFile?: LinkedDriveFile | null;
+  onOpenDriveSync: () => void;
   onToggleTheme: () => void;
   onResetVideo: () => void;
   onOpenLegal: () => void;
@@ -19,7 +21,7 @@ interface HeaderProps {
  * Architectural 3-zone studio header:
  * Zone 1: Brand wordmark
  * Zone 2: Landing section anchors (idle) or studio tools (active)
- * Zone 3: Server credit count, Legal, Theme toggle, New video action
+ * Zone 3: AI usage left today meter, Drive Sync, Legal, Theme toggle, New video action
  */
 export function Header({
   hasVideo,
@@ -27,6 +29,8 @@ export function Header({
   isLegalOpen,
   theme,
   usage,
+  linkedDriveFile,
+  onOpenDriveSync,
   onToggleTheme,
   onResetVideo,
   onOpenLegal,
@@ -34,9 +38,14 @@ export function Header({
   onOpenShortcuts,
   onOpenTour,
 }: HeaderProps) {
+  const usagePct =
+    usage && usage.limit > 0
+      ? Math.max(0, Math.min(100, Math.round((usage.remaining / usage.limit) * 100)))
+      : 100;
+
   return (
     <header className="sticky top-0 z-30 h-14 border-b border-[#DFDCD2] bg-[#F7F5F0] dark:border-[#2A2A2E] dark:bg-[#0E0E0F]">
-      <div className="mx-auto flex h-full max-w-6xl items-center justify-between gap-6 px-4 sm:px-6">
+      <div className="mx-auto flex h-full max-w-6xl items-center justify-between gap-4 px-4 sm:px-6">
         {/* Zone 1: Wordmark */}
         <button
           type="button"
@@ -58,22 +67,16 @@ export function Header({
             className="hidden items-center gap-6 text-sm font-medium text-[#64625D] lg:flex dark:text-[#8C8C93]"
           >
             <a
-              href="#demo"
-              className="whitespace-nowrap transition-colors hover:text-[#151517] dark:hover:text-[#F2F0EA]"
-            >
-              Demo
-            </a>
-            <a
               href="#how-it-works"
               className="whitespace-nowrap transition-colors hover:text-[#151517] dark:hover:text-[#F2F0EA]"
             >
               How it works
             </a>
             <a
-              href="#pricing"
+              href="#features"
               className="whitespace-nowrap transition-colors hover:text-[#151517] dark:hover:text-[#F2F0EA]"
             >
-              Pricing
+              Capabilities
             </a>
             <a
               href="#faq"
@@ -87,7 +90,7 @@ export function Header({
             <button
               type="button"
               onClick={onOpenTour}
-              className="inline-flex min-h-[40px] items-center gap-1.5 text-sm font-medium text-[#64625D] transition-colors hover:text-[#151517] dark:text-[#8C8C93] dark:hover:text-[#F2F0EA] whitespace-nowrap"
+              className="inline-flex min-h-[40px] items-center gap-1.5 whitespace-nowrap text-sm font-medium text-[#64625D] transition-colors hover:text-[#151517] dark:text-[#8C8C93] dark:hover:text-[#F2F0EA]"
             >
               <HelpCircle className="h-4 w-4" aria-hidden="true" />
               <span>Guide</span>
@@ -95,7 +98,7 @@ export function Header({
             <button
               type="button"
               onClick={onOpenShortcuts}
-              className="inline-flex min-h-[40px] items-center gap-1.5 text-sm font-medium text-[#64625D] transition-colors hover:text-[#151517] dark:text-[#8C8C93] dark:hover:text-[#F2F0EA] whitespace-nowrap"
+              className="inline-flex min-h-[40px] items-center gap-1.5 whitespace-nowrap text-sm font-medium text-[#64625D] transition-colors hover:text-[#151517] dark:text-[#8C8C93] dark:hover:text-[#F2F0EA]"
             >
               <Keyboard className="h-4 w-4" aria-hidden="true" />
               <span>Shortcuts</span>
@@ -103,21 +106,58 @@ export function Header({
           </div>
         )}
 
-        {/* Zone 3: Utility controls */}
-        <div className="flex shrink-0 items-center gap-2 sm:gap-3">
+        {/* Zone 3: AI Usage Meter, Drive Sync, Legal, Theme & Reset */}
+        <div className="flex shrink-0 items-center gap-2 sm:gap-2.5">
           {usage && (
-            <span
-              title={`Daily AI credits remaining: ${usage.remaining} of ${usage.limit}`}
-              className="hidden font-mono text-xs tabular-nums text-[#64625D] sm:inline dark:text-[#8C8C93]"
+            <div
+              title={`AI usage left today: ${usage.remaining} of ${usage.limit} daily units`}
+              className="hidden min-w-[118px] flex-col gap-1 rounded-md border border-[#DFDCD2] bg-white px-2.5 py-1 sm:flex dark:border-[#2A2A2E] dark:bg-[#151517]"
             >
-              {usage.remaining}/{usage.limit} credits
-            </span>
+              <div className="flex items-center justify-between gap-2 font-mono text-[10px] tabular-nums text-[#64625D] dark:text-[#8C8C93]">
+                <span>AI left today</span>
+                <span className="font-semibold text-[#151517] dark:text-[#F2F0EA]">
+                  {usage.remaining}/{usage.limit}
+                </span>
+              </div>
+              <div className="h-1 w-full overflow-hidden rounded-full bg-[#EFECE4] dark:bg-[#2A2A2E]">
+                <div
+                  className={`h-full rounded-full transition-[width] duration-200 ${
+                    usagePct <= 20 ? 'bg-red-500' : 'bg-[#E8A33D]'
+                  }`}
+                  style={{ width: `${usagePct}%` }}
+                />
+              </div>
+            </div>
           )}
 
           <button
             type="button"
+            onClick={onOpenDriveSync}
+            title={
+              linkedDriveFile
+                ? `Linked to Google Drive: ${linkedDriveFile.name}`
+                : 'Sync or open project from Google Drive'
+            }
+            className={`inline-flex min-h-[40px] shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg border px-2.5 py-1.5 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#E8A33D] ${
+              linkedDriveFile
+                ? 'border-[#E8A33D]/60 bg-[#E8A33D]/10 text-[#9A6516] dark:text-[#E8A33D]'
+                : 'border-[#DFDCD2] bg-white text-[#151517] hover:border-[#E8A33D] dark:border-[#2A2A2E] dark:bg-[#151517] dark:text-[#F2F0EA]'
+            }`}
+          >
+            {linkedDriveFile ? (
+              <Check className="h-3.5 w-3.5 text-[#E8A33D]" aria-hidden="true" />
+            ) : (
+              <Cloud className="h-3.5 w-3.5 text-[#E8A33D]" aria-hidden="true" />
+            )}
+            <span className="hidden md:inline">
+              {linkedDriveFile ? 'Drive synced' : 'Drive Sync'}
+            </span>
+          </button>
+
+          <button
+            type="button"
             onClick={isLegalOpen ? onBackToStudio : onOpenLegal}
-            className={`min-h-[40px] rounded-lg px-2 text-sm font-medium transition-colors hover:underline underline-offset-4 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#E8A33D] whitespace-nowrap shrink-0 ${
+            className={`min-h-[40px] shrink-0 whitespace-nowrap rounded-lg px-2 text-sm font-medium underline-offset-4 transition-colors hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#E8A33D] ${
               isLegalOpen
                 ? 'text-[#E8A33D]'
                 : 'text-[#64625D] hover:text-[#151517] dark:text-[#8C8C93] dark:hover:text-[#F2F0EA]'
@@ -140,7 +180,7 @@ export function Header({
               type="button"
               onClick={onResetVideo}
               disabled={isBusy}
-              className="inline-flex min-h-[40px] items-center gap-2 rounded-lg border border-[#DFDCD2] bg-white px-3 py-1.5 text-sm font-medium text-[#151517] transition-colors hover:border-[#E8A33D] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#E8A33D] disabled:cursor-not-allowed disabled:opacity-40 dark:border-[#2A2A2E] dark:bg-[#151517] dark:text-[#F2F0EA] whitespace-nowrap shrink-0"
+              className="inline-flex min-h-[40px] shrink-0 items-center gap-2 whitespace-nowrap rounded-lg border border-[#DFDCD2] bg-white px-3 py-1.5 text-sm font-medium text-[#151517] transition-colors hover:border-[#E8A33D] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#E8A33D] disabled:cursor-not-allowed disabled:opacity-40 dark:border-[#2A2A2E] dark:bg-[#151517] dark:text-[#F2F0EA]"
             >
               <Upload className="h-3.5 w-3.5 text-[#E8A33D]" aria-hidden="true" />
               <span className="hidden sm:inline">New video</span>
